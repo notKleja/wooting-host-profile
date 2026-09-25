@@ -67,7 +67,8 @@ control channel on `127.0.0.1:50053`. The Fluent UI sends profile selections to
 that persistent process instead of starting a fresh USB discovery operation.
 The watcher acknowledges a selection only after the keyboard has accepted the
 profile and lighting commands and the active profile index has been read back.
-USB reconnect detection runs every 100 ms instead of every two seconds.
+USB state polling runs once per second and backs off to the configured safe
+cooldown while Wootility owns WootDev, preventing response-queue interference.
 
 Only one watcher instance can run. Configuration is reloaded while it runs, so
 changing the selection in the GUI does not require restarting the watcher.
@@ -181,13 +182,20 @@ dotnet publish -c Release -p:Platform=x64 -r win-x64 --self-contained false
 
 ## USB protocol
 
+See [Protocol and Wootility Compatibility](docs/Protocol-and-Wootility-Compatibility.md)
+for the verified modern sequence, heartbeat fields, fallbacks, and coexistence
+rules.
+
 This project uses the Wooting RGB SDK's low-level USB transport and the profile
 commands independently documented by the MIT-licensed Wooting Profile Switcher:
 
-- `11`: read current onboard profile index
-- `23`: activate profile
-- `7`: reload profile
-- `32` and `29`: reset/refresh profile lighting
+- `73`: modern heartbeat with active profile and WootDev state
+- `11`: legacy active-profile fallback
+- `33`, `23`, `38`: initialize, activate, and reload a modern profile
+- `7`: legacy reload fallback
+- `55`: read profile metadata and names
+- `32`: release WootDev/RGB ownership
+- `29`: legacy lighting-refresh fallback
 
 ## Attribution
 

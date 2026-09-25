@@ -26,25 +26,16 @@ use serde_json::Value;
 use wooting_rgb_sys as rgb;
 
 const GET_CURRENT_KEYBOARD_PROFILE_INDEX: u8 = 11;
-const RELOAD_PROFILE: u8 = 7;
+const RELOAD_PROFILE_LEGACY: u8 = 7;
 const ACTIVATE_PROFILE: u8 = 23;
 const REFRESH_RGB_COLORS: u8 = 29;
 const WOOT_DEV_RESET_ALL: u8 = 32;
+const WOOT_DEV_INIT: u8 = 33;
+const RELOAD_PROFILE: u8 = 38;
 const GET_PROFILE_METADATA: u8 = 55;
+const HEARTBEAT: u8 = 73;
 const PROFILE_COUNT: u8 = 4;
 const IPC_ADDRESS: &str = "127.0.0.1:50053";
-const WOOTING_COMMAND_SIZE: i32 = 8;
-
-unsafe extern "C" {
-    fn wooting_usb_send_feature_buff(
-        command_id: u8,
-        parameter0: u8,
-        parameter1: u8,
-        parameter2: u8,
-        parameter3: u8,
-    ) -> i32;
-}
-
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
@@ -111,7 +102,7 @@ enum Command {
     /// Apply on startup and whenever the keyboard reconnects.
     Watch {
         /// Milliseconds between lightweight device checks.
-        #[arg(long = "interval-ms", visible_alias = "interval", default_value_t = 100, value_parser = clap::value_parser!(u64).range(10..))]
+        #[arg(long = "interval-ms", visible_alias = "interval", default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(100..))]
         interval_ms: u64,
 
         /// Reapply after a manual profile change, not only after reconnect.
@@ -517,6 +508,12 @@ fn discover_profiles(config: &mut Config) -> Vec<ProfileInfo> {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct KeyboardState {
+    profile: u8,
+    wootdev_active: bool,
+}
+
 struct Keyboard;
 
 impl Keyboard {
@@ -538,35 +535,36 @@ impl Keyboard {
         Some(Self)
     }
 
-    #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
-    fn current_profile(&self) -> Result<u8> {
+    #[allow(clippy::unused_self)]
+    fn command_response(&self, command: u8, profile: u8) -> Result<Vec<u8>> {
         unsafe {
             let response_size = rgb::wooting_usb_get_response_size() as usize;
             if response_size == 0 {
                 bail!("keyboard reported a zero-length response buffer")
             }
-
-            let uses_multi_report = rgb::wooting_usb_use_multi_report();
-            let report_offset = usize::from(uses_multi_report);
-            let extra_data_offset = usize::from(uses_multi_report);
             let mut buffer = vec![0_u8; response_size];
-
             let response = rgb::wooting_usb_send_feature_with_response(
                 buffer.as_mut_ptr(),
                 response_size,
-                GET_CURRENT_KEYBOARD_PROFILE_INDEX,
+                command,
                 0,
                 0,
                 0,
-                0,
+                profile,
             );
-
-            let expected_response = i32::try_from(response_size)
-                .context("keyboard response size does not fit in an i32")?;
-            if response != expected_response {
-                bail!("profile read failed: received {response} bytes, expected {response_size}")
+            if response != i32::try_from(response_size)? {
+                bail!("command {command} did not return a complete response")
             }
+            Ok(buffer)
+        }
+    }
 
+    fn legacy_state(&self) -> Result<KeyboardState> {
+        let buffer = self.command_response(GET_CURRENT_KEYBOARD_PROFILE_INDEX, 0)?;
+        unsafe {
+            let uses_multi_report = rgb::wooting_usb_use_multi_report();
+            let report_offset = usize::from(uses_multi_report);
+            let extra_data_offset = usize::from(uses_multi_report);
             let is_v2 = rgb::wooting_usb_use_v2_interface();
             let data_offset = report_offset + if is_v2 { 5 } else { 4 } + extra_data_offset;
             let profile = *buffer
@@ -576,9 +574,75 @@ impl Keyboard {
             if profile >= PROFILE_COUNT {
                 bail!("keyboard returned unsupported onboard profile index {profile}")
             }
-
-            Ok(profile)
+            Ok(KeyboardState {
+                profile,
+                wootdev_active: false,
+            })
         }
+    }
+
+    fn heartbeat_state(&self) -> Result<KeyboardState> {
+        let buffer = self.command_response(HEARTBEAT, 0)?;
+        unsafe {
+            let command_offset = 2 + usize::from(rgb::wooting_usb_use_multi_report());
+            if buffer.get(command_offset) != Some(&HEARTBEAT) {
+                bail!("heartbeat response echoed the wrong command")
+            }
+            let mut cursor = command_offset + 2;
+            let mut profile = None;
+            let mut wootdev_active = false;
+            while let Some(&tag) = buffer.get(cursor) {
+                if tag == 0 {
+                    break;
+                }
+                cursor += 1;
+                if tag & 0x07 != 0 {
+                    bail!("heartbeat contained an unsupported protobuf field")
+                }
+                let mut value = 0_u64;
+                let mut shift = 0_u32;
+                loop {
+                    let byte = *buffer
+                        .get(cursor)
+                        .context("heartbeat protobuf was truncated")?;
+                    cursor += 1;
+                    value |= u64::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                    shift += 7;
+                    if shift >= 64 {
+                        bail!("heartbeat protobuf varint was invalid")
+                    }
+                }
+                match tag >> 3 {
+                    1 => profile = Some(u8::try_from(value)?),
+                    2 => wootdev_active = value != 0,
+                    _ => {}
+                }
+            }
+            let profile = profile.context("heartbeat omitted the active profile")?;
+            if profile >= PROFILE_COUNT {
+                bail!("heartbeat returned unsupported onboard profile index {profile}")
+            }
+            Ok(KeyboardState {
+                profile,
+                wootdev_active,
+            })
+        }
+    }
+
+    fn current_state(&self) -> Result<KeyboardState> {
+        let supports_heartbeat = unsafe { rgb::wooting_usb_use_multi_report() };
+        if supports_heartbeat {
+            self.heartbeat_state().or_else(|_| self.legacy_state())
+        } else {
+            self.legacy_state()
+        }
+    }
+
+    fn current_profile(&self) -> Result<u8> {
+        self.current_state().map(|state| state.profile)
     }
 
     #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
@@ -640,70 +704,42 @@ impl Keyboard {
             bail!("profile index {profile} is outside the onboard profile range")
         }
 
-        self.send_profile_commands_fast(profile)?;
-        self.finish_profile_switch(profile, config)
-    }
+        self.send_feature(WOOT_DEV_INIT, 0, "initialization")?;
+        self.send_feature(ACTIVATE_PROFILE, profile, "profile activation")?;
+        thread::sleep(Duration::from_millis(100));
 
-    #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
-    fn send_profile_commands_fast(&self, profile: u8) -> Result<()> {
-        unsafe {
-            let activate = wooting_usb_send_feature_buff(ACTIVATE_PROFILE, 0, 0, 0, profile);
-            let reload = wooting_usb_send_feature_buff(RELOAD_PROFILE, 0, 0, 0, profile);
-            if activate != WOOTING_COMMAND_SIZE || reload != WOOTING_COMMAND_SIZE {
-                bail!("keyboard rejected the immediate profile commands")
+        let modern =
+            unsafe { rgb::wooting_usb_use_v2_interface() || rgb::wooting_usb_use_multi_report() };
+        let reload = if modern {
+            RELOAD_PROFILE
+        } else {
+            RELOAD_PROFILE_LEGACY
+        };
+        if let Err(error) = self.send_feature(reload, profile, "profile reload") {
+            if !modern {
+                return Err(error);
             }
+            thread::sleep(Duration::from_millis(config.command_delay_ms.max(250)));
+            self.send_feature(RELOAD_PROFILE_LEGACY, profile, "legacy profile reload")?;
+        }
+
+        if !self.wait_for_profile(profile, Duration::from_millis(500)) {
+            bail!("keyboard did not report P{} after activation", profile + 1)
+        }
+
+        self.send_feature(WOOT_DEV_RESET_ALL, 0, "RGB ownership reset")?;
+        if config.refresh_lighting && !modern {
+            thread::sleep(Duration::from_millis(config.command_delay_ms));
+            self.send_feature(REFRESH_RGB_COLORS, profile, "legacy RGB refresh")?;
         }
         Ok(())
     }
 
     #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
-    fn drain_feature_response(&self) {
+    fn send_feature(&self, command: u8, profile: u8, operation: &str) -> Result<()> {
         unsafe {
-            let response_size = rgb::wooting_usb_get_response_size() as usize;
-            let mut buffer = vec![0_u8; response_size];
-            let _ =
-                rgb::wooting_usb_read_response_timeout(buffer.as_mut_ptr(), response_size, 1_000);
-        }
-    }
-
-    fn finish_profile_switch(&self, profile: u8, config: &Config) -> Result<()> {
-        // Clear acknowledgements for activate and reload before sending a query.
-        self.drain_feature_response();
-        self.drain_feature_response();
-
-        // Modern firmware accepts activate + reload back-to-back. Polling avoids
-        // the fixed 250 ms sleeps used by older third-party switchers.
-        if !self.wait_for_profile(profile, Duration::from_millis(75)) {
-            // Legacy fallback: older firmware may require time before another reload.
-            thread::sleep(Duration::from_millis(config.command_delay_ms.max(250)));
-            unsafe {
-                if !rgb::wooting_usb_send_feature(RELOAD_PROFILE, 0, 0, 0, profile) {
-                    bail!("keyboard rejected the legacy reload-profile command")
-                }
-            }
-            let legacy_timeout = Duration::from_millis(250);
-            if !self.wait_for_profile(profile, legacy_timeout) {
-                bail!("keyboard did not report P{} after activation", profile + 1)
-            }
-        }
-
-        // Profile activation and lighting activation are separate firmware states.
-        // A successful profile-index read therefore does not prove that the RGB
-        // engine loaded the selected profile. Always finish the lighting sequence
-        // when requested, including after the fast profile-switch path.
-        if config.refresh_lighting {
-            let delay = Duration::from_millis(config.command_delay_ms);
-            thread::sleep(delay);
-            unsafe {
-                if !rgb::wooting_usb_send_feature(WOOT_DEV_RESET_ALL, 0, 0, 0, 0) {
-                    bail!("keyboard rejected the RGB reset command")
-                }
-            }
-            thread::sleep(delay);
-            unsafe {
-                if !rgb::wooting_usb_send_feature(REFRESH_RGB_COLORS, 0, 0, 0, profile) {
-                    bail!("keyboard rejected the RGB refresh command")
-                }
+            if !rgb::wooting_usb_send_feature(command, 0, 0, 0, profile) {
+                bail!("keyboard rejected {operation} command {command}")
             }
         }
         Ok(())
@@ -911,6 +947,7 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
         }
 
         if Instant::now() >= next_device_check {
+            let mut next_check_delay = interval;
             if keyboard.is_none() {
                 keyboard = Keyboard::connect_first();
                 if let Some(connected) = keyboard.as_ref() {
@@ -932,9 +969,10 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
                         Instant::now() + Duration::from_millis(config.enforce_interval_ms);
                 }
             } else if let Some(connected) = keyboard.as_ref() {
-                if connected.current_profile().is_ok() {
+                if let Ok(state) = connected.current_state() {
                     let config = load_config(config_path)?;
-                    let enforcement_due = config.enabled
+                    let enforcement_due = !state.wootdev_active
+                        && config.enabled
                         && (enforce_override || config.enforce)
                         && Instant::now() >= next_enforcement_check;
                     if enforcement_due {
@@ -947,12 +985,18 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
                         next_enforcement_check =
                             Instant::now() + Duration::from_millis(config.enforce_interval_ms);
                     }
+                    if state.wootdev_active {
+                        next_enforcement_check =
+                            Instant::now() + Duration::from_millis(config.enforce_interval_ms);
+                        next_check_delay =
+                            interval.max(Duration::from_millis(config.enforce_interval_ms));
+                    }
                 } else {
                     append_log(config_path, "Keyboard disconnected");
                     keyboard = None;
                 }
             }
-            next_device_check = Instant::now() + interval;
+            next_device_check = Instant::now() + next_check_delay;
         }
 
         thread::sleep(Duration::from_millis(5));

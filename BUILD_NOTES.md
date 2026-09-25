@@ -61,11 +61,13 @@ those names locally for future offline fallback.
   supplies a profile returned by enumeration.
 - The watcher now keeps the HID device selected and accepts loopback-only IPC
   commands on `127.0.0.1:50053`.
-- Activate and reload commands are dispatched without a fixed delay, then the
-  active profile index is read back. When lighting refresh is enabled, the
-  watcher waits for and validates the RGB reset and refresh acknowledgements
-  before reporting success to the UI.
-- Reconnect polling was reduced from 2,000 ms to 100 ms.
+- Modern switching waits for acknowledgements in the sequence WootDevInit (33),
+  ActivateProfile (23), 100 ms settle, and ReloadProfile (38), then verifies the
+  heartbeat state and releases WootDev ownership with command 32. Command 7 and
+  manual RGB refresh 29 remain legacy fallbacks.
+- Modern multi-report devices use command 73 heartbeat state at one-second
+  cadence; command 11 remains the legacy fallback. Polling backs off while
+  Wootility reports WootDev ownership.
 - The hidden watcher detected the keyboard and verified the configured profile.
 - A second watcher exited while the first held the single-instance lock.
 - Background logging succeeded.
