@@ -16,17 +16,27 @@ four possible onboard slots:
 The Rust agent returned exactly those two configured profiles and marked the
 active slot. Empty capacity slots were not shown.
 
+A browserless test with an empty Chromium data directory and fresh config read
+`Typing Profile` and `mac profile` directly from keyboard metadata and cached
+those names locally for future offline fallback.
+
 ## Windows WinUI 3 and tray behavior
 
 - The configuration front end uses WinUI 3/XAML and Fluent controls.
 - The published app launched successfully from its installed location.
-- The main window opened with the title `Wooting Host Profile`.
+- The main window opened with the title `Wooting Switch`.
 - The WinUI process remained responsive.
 - The Rust HID watcher launched hidden from the installed app directory.
 - Sending a normal close request removed the window from the taskbar while the
   WinUI notification-area process and Rust watcher both remained alive.
-- The window is fixed at 540×520 and cannot be resized or maximized.
+- The window opens at a compact preferred client width and the measured final
+  content height. Those become DPI-aware minimum dimensions; the window can be
+  enlarged, while the content stretches and scrolls when required.
 - Startup is managed by the WinUI app and launches it with `--tray`.
+- A named instance mutex prevents duplicate WinUI processes; a second launch
+  signals the existing process to show and activate its window.
+- The tray icon can be hidden persistently and a later app launch still restores
+  the existing hidden window through the single-instance signal.
 
 ## Icon verification
 
@@ -51,11 +61,10 @@ active slot. Empty capacity slots were not shown.
   supplies a profile returned by enumeration.
 - The watcher now keeps the HID device selected and accepts loopback-only IPC
   commands on `127.0.0.1:50053`.
-- Activate and reload commands are dispatched without fixed sleeps. The UI is
-  acknowledged immediately; HID responses are drained and the result is
-  verified afterward in the watcher.
-- Packaged installed-agent benchmarks measured P2→P1 at 37 ms and P1→P2 at
-  24 ms, restoring P2 at the end of the test.
+- Activate and reload commands are dispatched without a fixed delay, then the
+  active profile index is read back. When lighting refresh is enabled, the
+  watcher waits for and validates the RGB reset and refresh acknowledgements
+  before reporting success to the UI.
 - Reconnect polling was reduced from 2,000 ms to 100 ms.
 - The hidden watcher detected the keyboard and verified the configured profile.
 - A second watcher exited while the first held the single-instance lock.

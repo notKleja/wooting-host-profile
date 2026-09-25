@@ -3,112 +3,219 @@
     x:Class="WootingHostProfile_WinUI.MainPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    xmlns:local="using:WootingHostProfile_WinUI">
+    xmlns:local="using:WootingHostProfile_WinUI"
+    Background="#181A1B"
+    RequestedTheme="Dark">
 
-    <ScrollViewer VerticalScrollBarVisibility="Auto">
-        <Grid Padding="20,14,20,18" RowSpacing="12">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-            </Grid.RowDefinitions>
+    <Page.Resources>
+        <SolidColorBrush x:Key="SurfaceBrush" Color="#202426" />
+        <SolidColorBrush x:Key="HoverBrush" Color="#292E31" />
+        <SolidColorBrush x:Key="BorderBrush" Color="#343A3D" />
+        <SolidColorBrush x:Key="TextBrush" Color="#E8EBED" />
+        <SolidColorBrush x:Key="MutedBrush" Color="#A6ADB5" />
+        <SolidColorBrush x:Key="AccentBrush" Color="#FFD45C" />
 
-            <StackPanel Spacing="4">
-                <TextBlock Style="{StaticResource TitleTextBlockStyle}" Text="Windows profile" />
-                <TextBlock
-                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                    Text="Choose the configured onboard profile this PC should use."
-                    TextWrapping="Wrap" />
-            </StackPanel>
+        <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillChecked" Color="#FFD45C" />
+        <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPointerOver" Color="#FFE08A" />
+        <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPressed" Color="#E8BC43" />
+        <SolidColorBrush x:Key="CheckBoxCheckBorderBrushChecked" Color="#FFD45C" />
+        <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundChecked" Color="#181A1B" />
 
-            <Border
-                Grid.Row="1"
-                Padding="14,8"
-                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1"
-                CornerRadius="8">
-                <Grid>
-                    <RadioButtons
-                        x:Name="ProfilePicker"
-                        Header="Configured profiles"
-                        ItemsSource="{x:Bind Profiles, Mode=OneWay}">
-                        <RadioButtons.ItemTemplate>
-                            <DataTemplate x:DataType="local:ProfileInfo">
-                                <TextBlock Margin="0,4" Text="{x:Bind DisplayName}" />
-                            </DataTemplate>
-                        </RadioButtons.ItemTemplate>
-                    </RadioButtons>
+        <Style x:Key="RememberButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+            <Setter Property="Foreground" Value="#181A1B" />
+            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="7" />
+            <Setter Property="Padding" Value="14,7" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+    </Page.Resources>
+
+    <Grid>
+        <ScrollViewer
+            FontFamily="Segoe UI Variable Text"
+            HorizontalScrollMode="Disabled"
+            VerticalScrollBarVisibility="Auto">
+            <Grid
+                x:Name="ContentGrid"
+                Padding="16,10,16,12"
+                RowSpacing="11">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Spacing="1">
+                        <TextBlock
+                            Foreground="{StaticResource TextBrush}"
+                            FontSize="18"
+                            FontWeight="SemiBold"
+                            Text="Windows profile" />
+                        <TextBlock
+                            Foreground="{StaticResource MutedBrush}"
+                            FontSize="11"
+                            Text="Choose the profile for this PC" />
+                    </StackPanel>
                     <ProgressRing
                         x:Name="LoadingRing"
-                        Width="28"
-                        Height="28"
-                        HorizontalAlignment="Right"
-                        VerticalAlignment="Top"
+                        Grid.Column="1"
+                        Width="20"
+                        Height="20"
+                        VerticalAlignment="Center"
+                        Foreground="{StaticResource AccentBrush}"
                         IsActive="True" />
                 </Grid>
-            </Border>
 
-            <InfoBar
-                Grid.Row="2"
-                IsClosable="False"
-                IsOpen="True"
-                Message="Do not enable Wootility App Linking or another app-specific profile switcher. Those tools can replace the system profile selected here."
-                Severity="Warning"
-                Title="Avoid app-specific profile overrides" />
+                <Grid Grid.Row="1" ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
 
-            <Border
-                Grid.Row="3"
-                Padding="14,8"
-                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1"
-                CornerRadius="8">
-                <StackPanel Spacing="6">
-                    <ToggleSwitch
-                        x:Name="StartupToggle"
-                        Header="Start at sign-in"
-                        OffContent="The app and watcher will not start automatically"
-                        OnContent="Launch hidden in the notification area" />
+                    <ComboBox
+                        x:Name="ProfilePicker"
+                        Height="36"
+                        HorizontalAlignment="Stretch"
+                        Background="{StaticResource SurfaceBrush}"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        Foreground="{StaticResource TextBrush}"
+                        ItemsSource="{x:Bind Profiles, Mode=OneWay}"
+                        PlaceholderText="Choose profile"
+                        SelectionChanged="ProfilePicker_SelectionChanged"
+                        VerticalContentAlignment="Center">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="local:ProfileInfo">
+                                <Grid ColumnSpacing="9">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        VerticalAlignment="Center"
+                                        Foreground="{StaticResource MutedBrush}"
+                                        FontSize="11"
+                                        FontWeight="SemiBold"
+                                        Text="{x:Bind SlotLabel}" />
+                                    <TextBlock
+                                        Grid.Column="1"
+                                        VerticalAlignment="Center"
+                                        Foreground="{StaticResource TextBrush}"
+                                        Text="{x:Bind Name}"
+                                        TextTrimming="CharacterEllipsis" />
+                                    <TextBlock
+                                        Grid.Column="2"
+                                        VerticalAlignment="Center"
+                                        Foreground="{StaticResource AccentBrush}"
+                                        FontSize="9"
+                                        FontWeight="SemiBold"
+                                        Text="{x:Bind ActiveLabel}" />
+                                </Grid>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+
+                    <Button
+                        x:Name="RememberButton"
+                        Grid.Column="1"
+                        Height="36"
+                        Click="Remember_Click"
+                        Content="Remember"
+                        IsEnabled="False"
+                        Style="{StaticResource RememberButtonStyle}"
+                        VerticalContentAlignment="Center" />
+                </Grid>
+
+                <Border
+                    Grid.Row="2"
+                    Padding="10,7"
+                    Background="{StaticResource SurfaceBrush}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="10">
+                    <StackPanel Spacing="0">
+                        <CheckBox
+                            x:Name="AppEnabledCheckBox"
+                            HorizontalAlignment="Stretch"
+                            Foreground="{StaticResource TextBrush}"
+                            Click="Setting_Click"
+                            Content="Switch profiles automatically" />
+                        <CheckBox
+                            x:Name="EnforceCheckBox"
+                            HorizontalAlignment="Stretch"
+                            Foreground="{StaticResource TextBrush}"
+                            Click="Setting_Click">
+                            <StackPanel Spacing="0">
+                                <TextBlock Text="Keep this profile active" />
+                                <TextBlock
+                                    Foreground="{StaticResource MutedBrush}"
+                                    FontSize="10"
+                                    Text="Checks every 5 seconds" />
+                            </StackPanel>
+                        </CheckBox>
+                        <CheckBox
+                            x:Name="StartupCheckBox"
+                            HorizontalAlignment="Stretch"
+                            Foreground="{StaticResource TextBrush}"
+                            Click="Setting_Click"
+                            Content="Open at sign-in" />
+                        <CheckBox
+                            x:Name="HideTrayCheckBox"
+                            HorizontalAlignment="Stretch"
+                            Foreground="{StaticResource TextBrush}"
+                            Click="Setting_Click"
+                            Content="Hide tray icon" />
+                    </StackPanel>
+                </Border>
+
+                <Grid Grid.Row="3" ColumnSpacing="7">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <FontIcon
+                        Margin="0,1,0,0"
+                        VerticalAlignment="Top"
+                        Foreground="{StaticResource AccentBrush}"
+                        FontSize="11"
+                        Glyph="&#xE7BA;" />
                     <TextBlock
-                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                        Text="Closing or minimizing this window keeps the app in the notification area. Double-click its tray icon to reopen it."
+                        Grid.Column="1"
+                        VerticalAlignment="Top"
+                        Foreground="{StaticResource MutedBrush}"
+                        FontSize="10"
+                        Text="Wooting’s app-profile syncing may conflict with this app."
                         TextWrapping="Wrap" />
-                </StackPanel>
-            </Border>
+                </Grid>
+            </Grid>
+        </ScrollViewer>
 
+        <Border
+            x:Name="StatusOverlay"
+            Margin="16"
+            Padding="10,8"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Bottom"
+            Background="#303538"
+            BorderBrush="{StaticResource AccentBrush}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Visibility="Collapsed">
             <TextBlock
                 x:Name="StatusText"
-                Grid.Row="4"
-                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                Text="Reading configured profiles…"
+                Foreground="{StaticResource TextBrush}"
+                FontSize="11"
+                MaxLines="2"
+                TextTrimming="CharacterEllipsis"
                 TextWrapping="Wrap" />
-
-            <Grid Grid.Row="5" ColumnSpacing="8">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <Button Click="Refresh_Click" Content="Refresh" />
-                <Button
-                    x:Name="ApplyButton"
-                    Grid.Column="1"
-                    Click="Apply_Click"
-                    Content="Apply now"
-                    IsEnabled="False" />
-                <Button
-                    x:Name="SaveButton"
-                    Grid.Column="3"
-                    Click="Save_Click"
-                    Content="Save and keep running"
-                    IsEnabled="False"
-                    Style="{StaticResource AccentButtonStyle}" />
-            </Grid>
-        </Grid>
-    </ScrollViewer>
+        </Border>
+    </Grid>
 </Page>

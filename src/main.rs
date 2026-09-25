@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
@@ -19,7 +20,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use encoding_rs::{UTF_16LE, WINDOWS_1252};
 use fs2::FileExt;
-use rusty_leveldb::{CompressorId, DB, Options, compressor::SnappyCompressor};
+use rusty_leveldb::{CompressorId, DB, LdbIterator, Options, compressor::SnappyCompressor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wooting_rgb_sys as rgb;
@@ -29,6 +30,7 @@ const RELOAD_PROFILE: u8 = 7;
 const ACTIVATE_PROFILE: u8 = 23;
 const REFRESH_RGB_COLORS: u8 = 29;
 const WOOT_DEV_RESET_ALL: u8 = 32;
+const GET_PROFILE_METADATA: u8 = 55;
 const PROFILE_COUNT: u8 = 4;
 const IPC_ADDRESS: &str = "127.0.0.1:50053";
 const WOOTING_COMMAND_SIZE: i32 = 8;
@@ -65,6 +67,33 @@ enum Command {
 
     /// Report whether the hidden watcher is registered to start at login.
     StartupStatus,
+
+    /// Report whether automatic profile switching is enabled.
+    EnabledStatus,
+
+    /// Enable or disable automatic profile switching.
+    SetEnabled {
+        #[arg(value_enum)]
+        state: EnabledChoice,
+    },
+
+    /// Report whether the saved profile is periodically enforced.
+    EnforceStatus,
+
+    /// Enable or disable periodic profile enforcement.
+    SetEnforce {
+        #[arg(value_enum)]
+        state: EnabledChoice,
+    },
+
+    /// Report whether the app's tray or menu-bar icon should be shown.
+    StatusIconStatus,
+
+    /// Show or hide the app's tray or menu-bar icon.
+    SetStatusIcon {
+        #[arg(value_enum)]
+        state: StatusIconChoice,
+    },
 
     /// Show the connected keyboard's current onboard profile.
     Status,
@@ -119,18 +148,44 @@ enum StartupChoice {
     Disable,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EnabledChoice {
+    Enable,
+    Disable,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StatusIconChoice {
+    Show,
+    Hide,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ProfileInfo {
     /// Human-facing profile number.
     index: u8,
     name: String,
     active: bool,
+    assigned: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct Config {
+    /// Apply the saved OS profile automatically.
+    #[serde(default = "default_true")]
+    enabled: bool,
+
+    /// Show the app icon in the Windows tray or macOS menu/Dock area.
+    #[serde(default = "default_true")]
+    show_status_icon: bool,
+
     #[serde(default)]
     profiles: Profiles,
+
+    /// Last profile names read from the keyboard or Wootility cache.
+    #[serde(default)]
+    profile_names: BTreeMap<u8, String>,
 
     /// Refresh the profile's RGB state after switching.
     #[serde(default = "default_true")]
@@ -143,6 +198,10 @@ struct Config {
     /// Reapply if the profile changes while the keyboard stays connected.
     #[serde(default)]
     enforce: bool,
+
+    /// Minimum delay between enforcement attempts.
+    #[serde(default = "default_enforce_interval_ms")]
+    enforce_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -159,6 +218,10 @@ const fn default_true() -> bool {
 
 const fn default_command_delay_ms() -> u64 {
     250
+}
+
+const fn default_enforce_interval_ms() -> u64 {
+    5_000
 }
 
 impl Config {
@@ -212,10 +275,14 @@ fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
 fn load_config(path: &Path) -> Result<Config> {
     if !path.exists() {
         return Ok(Config {
+            enabled: default_true(),
+            show_status_icon: default_true(),
             profiles: Profiles::default(),
+            profile_names: BTreeMap::new(),
             refresh_lighting: default_true(),
             command_delay_ms: default_command_delay_ms(),
             enforce: false,
+            enforce_interval_ms: default_enforce_interval_ms(),
         });
     }
 
@@ -307,6 +374,7 @@ fn copy_leveldb(source: &Path, destination: &Path) -> Result<()> {
 
 fn load_profiles_from_leveldb(source: &Path) -> Result<Vec<(u8, String)>> {
     const WEB_KEY: &[u8] = b"_https://wootility.io\x00\x01persist:root";
+    const WEB_KEY_SUFFIX: &[u8] = b"persist:root";
     let temporary = tempfile::tempdir()?;
     copy_leveldb(source, temporary.path())?;
 
@@ -317,11 +385,29 @@ fn load_profiles_from_leveldb(source: &Path) -> Result<Vec<(u8, String)>> {
         ..Default::default()
     };
     let mut database = DB::open(temporary.path(), options)?;
-    let encoded = database
-        .get(WEB_KEY)
-        .context("Wootility Web state was not present in this browser profile")?;
-    let decoded = decode_chromium_string(&encoded)?;
-    let root: Value = serde_json::from_str(&decoded)?;
+    let root = if let Some(encoded) = database.get(WEB_KEY) {
+        let decoded = decode_chromium_string(&encoded)?;
+        serde_json::from_str(&decoded)?
+    } else {
+        let mut iterator = database.new_iter()?;
+        let mut discovered = None;
+        while let Some((key, encoded)) = iterator.next() {
+            if !key.ends_with(WEB_KEY_SUFFIX) {
+                continue;
+            }
+            let Ok(decoded) = decode_chromium_string(&encoded) else {
+                continue;
+            };
+            let Ok(candidate) = serde_json::from_str::<Value>(&decoded) else {
+                continue;
+            };
+            if candidate.get("devices").is_some() && candidate.get("profiles").is_some() {
+                discovered = Some(candidate);
+                break;
+            }
+        }
+        discovered.context("Wootility Web state was not present in this browser profile")?
+    };
 
     let devices_text = root
         .get("devices")
@@ -360,34 +446,75 @@ fn load_profiles_from_leveldb(source: &Path) -> Result<Vec<(u8, String)>> {
         .collect()
 }
 
-fn discover_profiles() -> Result<Vec<ProfileInfo>> {
-    let current = Keyboard::connect_first()
-        .and_then(|keyboard| keyboard.current_profile().ok())
-        .map(|index| index + 1);
+fn profile_info(
+    profiles: Vec<(u8, String)>,
+    current: Option<u8>,
+    assigned: Option<u8>,
+) -> Vec<ProfileInfo> {
+    profiles
+        .into_iter()
+        .map(|(index, name)| ProfileInfo {
+            index,
+            name,
+            active: current == Some(index),
+            assigned: assigned == Some(index),
+        })
+        .collect()
+}
 
-    let mut last_error = None;
-    for path in wootility_leveldb_paths() {
-        match load_profiles_from_leveldb(&path) {
-            Ok(profiles) if !profiles.is_empty() => {
-                return Ok(profiles
-                    .into_iter()
-                    .map(|(index, name)| ProfileInfo {
-                        index,
-                        name,
-                        active: current == Some(index),
-                    })
-                    .collect());
-            }
-            Ok(_) => {}
-            Err(error) => last_error = Some(error),
+fn cache_profile_names(config: &mut Config, profiles: &[(u8, String)]) {
+    config.profile_names = profiles.iter().cloned().collect();
+}
+
+fn discover_profiles(config: &mut Config) -> Vec<ProfileInfo> {
+    let keyboard = Keyboard::connect_first();
+    let current = keyboard
+        .as_ref()
+        .and_then(|connected| connected.current_profile().ok())
+        .map(|index| index + 1);
+    let assigned = config.configured_profile().ok().map(|index| index + 1);
+
+    if let Some(connected) = keyboard.as_ref() {
+        let profiles: Vec<_> = (0..PROFILE_COUNT)
+            .filter_map(|index| {
+                connected
+                    .profile_name(index)
+                    .ok()
+                    .flatten()
+                    .map(|name| (index + 1, name))
+            })
+            .collect();
+        if !profiles.is_empty() {
+            cache_profile_names(config, &profiles);
+            return profile_info(profiles, current, assigned);
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        anyhow!(
-            "no Wootility Web profile cache was found; open wootility.io once and connect the keyboard"
-        )
-    }))
+    for path in wootility_leveldb_paths() {
+        if let Ok(profiles) = load_profiles_from_leveldb(&path)
+            && !profiles.is_empty()
+        {
+            cache_profile_names(config, &profiles);
+            return profile_info(profiles, current, assigned);
+        }
+    }
+
+    if !config.profile_names.is_empty() {
+        let profiles = config
+            .profile_names
+            .iter()
+            .map(|(index, name)| (*index, name.clone()))
+            .collect();
+        return profile_info(profiles, current, assigned);
+    }
+
+    profile_info(
+        (1..=PROFILE_COUNT)
+            .map(|index| (index, format!("Profile {index}")))
+            .collect(),
+        current,
+        assigned,
+    )
 }
 
 struct Keyboard;
@@ -403,6 +530,10 @@ impl Keyboard {
                 rgb::wooting_usb_disconnect(false);
                 return None;
             }
+            // The RGB SDK automatically sends WootDevInit while opening the
+            // keyboard. Relinquish that state immediately: this application
+            // uses the configuration protocol, not live third-party RGB.
+            let _ = rgb::wooting_usb_send_feature(WOOT_DEV_RESET_ALL, 0, 0, 0, 0);
         }
         Some(Self)
     }
@@ -451,6 +582,59 @@ impl Keyboard {
     }
 
     #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
+    fn profile_name(&self, profile: u8) -> Result<Option<String>> {
+        unsafe {
+            let response_size = rgb::wooting_usb_get_response_size() as usize;
+            if response_size == 0 {
+                bail!("keyboard reported a zero-length response buffer")
+            }
+
+            let uses_multi_report = rgb::wooting_usb_use_multi_report();
+            let report_offset = usize::from(uses_multi_report);
+            let extra_data_offset = usize::from(uses_multi_report);
+            let mut buffer = vec![0_u8; response_size];
+            let response = rgb::wooting_usb_send_feature_with_response(
+                buffer.as_mut_ptr(),
+                response_size,
+                GET_PROFILE_METADATA,
+                0,
+                0,
+                0,
+                profile,
+            );
+            let expected_response = i32::try_from(response_size)?;
+            if response != expected_response {
+                bail!("profile metadata read failed")
+            }
+
+            let is_v2 = rgb::wooting_usb_use_v2_interface();
+            let data_offset = report_offset + if is_v2 { 5 } else { 4 } + extra_data_offset;
+            let data = buffer
+                .get(data_offset..)
+                .context("profile metadata response had no payload")?;
+            let payload_length = usize::from(*data.first().context("metadata length was missing")?);
+            if payload_length == 0 {
+                return Ok(None);
+            }
+            let protobuf = data
+                .get(2..2 + payload_length)
+                .context("profile metadata payload was truncated")?;
+            if protobuf.first() != Some(&0x0A) {
+                bail!("profile metadata did not contain a name")
+            }
+            let name_length = usize::from(
+                *protobuf
+                    .get(1)
+                    .context("profile metadata name length was missing")?,
+            );
+            let name = protobuf
+                .get(2..2 + name_length)
+                .context("profile metadata name was truncated")?;
+            Ok(Some(String::from_utf8(name.to_vec())?))
+        }
+    }
+
+    #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
     fn activate_profile(&self, profile: u8, config: &Config) -> Result<()> {
         if profile >= PROFILE_COUNT {
             bail!("profile index {profile} is outside the onboard profile range")
@@ -489,27 +673,37 @@ impl Keyboard {
 
         // Modern firmware accepts activate + reload back-to-back. Polling avoids
         // the fixed 250 ms sleeps used by older third-party switchers.
-        if self.wait_for_profile(profile, Duration::from_millis(75)) {
-            return Ok(());
-        }
-
-        // Legacy fallback: older firmware may require time before another reload.
-        thread::sleep(Duration::from_millis(config.command_delay_ms.max(250)));
-        unsafe {
-            if !rgb::wooting_usb_send_feature(RELOAD_PROFILE, 0, 0, 0, profile) {
-                bail!("keyboard rejected the legacy reload-profile command")
+        if !self.wait_for_profile(profile, Duration::from_millis(75)) {
+            // Legacy fallback: older firmware may require time before another reload.
+            thread::sleep(Duration::from_millis(config.command_delay_ms.max(250)));
+            unsafe {
+                if !rgb::wooting_usb_send_feature(RELOAD_PROFILE, 0, 0, 0, profile) {
+                    bail!("keyboard rejected the legacy reload-profile command")
+                }
+            }
+            let legacy_timeout = Duration::from_millis(250);
+            if !self.wait_for_profile(profile, legacy_timeout) {
+                bail!("keyboard did not report P{} after activation", profile + 1)
             }
         }
-        let legacy_timeout = Duration::from_millis(250);
-        if !self.wait_for_profile(profile, legacy_timeout) {
-            bail!("keyboard did not report P{} after activation", profile + 1)
-        }
 
-        // Only legacy devices need the manual lighting recovery sequence.
+        // Profile activation and lighting activation are separate firmware states.
+        // A successful profile-index read therefore does not prove that the RGB
+        // engine loaded the selected profile. Always finish the lighting sequence
+        // when requested, including after the fast profile-switch path.
         if config.refresh_lighting {
+            let delay = Duration::from_millis(config.command_delay_ms);
+            thread::sleep(delay);
             unsafe {
-                let _ = rgb::wooting_usb_send_feature(WOOT_DEV_RESET_ALL, 0, 0, 0, 0);
-                let _ = rgb::wooting_usb_send_feature(REFRESH_RGB_COLORS, 0, 0, 0, profile);
+                if !rgb::wooting_usb_send_feature(WOOT_DEV_RESET_ALL, 0, 0, 0, 0) {
+                    bail!("keyboard rejected the RGB reset command")
+                }
+            }
+            thread::sleep(delay);
+            unsafe {
+                if !rgb::wooting_usb_send_feature(REFRESH_RGB_COLORS, 0, 0, 0, profile) {
+                    bail!("keyboard rejected the RGB refresh command")
+                }
             }
         }
         Ok(())
@@ -603,8 +797,10 @@ fn try_ipc_set(human_profile: u8) -> Result<bool> {
         }
         Err(error) => return Err(error.into()),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    // A verified switch may include the configured delays around the RGB reset
+    // and refresh commands. Leave enough time for that complete transaction.
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     writeln!(stream, "SET {human_profile}")?;
     stream.shutdown(Shutdown::Write)?;
     let mut buffer = [0_u8; 256];
@@ -648,26 +844,22 @@ fn handle_ipc_stream(mut stream: TcpStream, keyboard: &mut Option<Keyboard>, con
             let _ = writeln!(stream, "ERR {error:#}");
         }
         Ok((profile, config)) => {
-            // Keep the Fluent UI off the HID acknowledgement path. The watcher
-            // sends and verifies immediately after acknowledging locally.
-            let _ = stream.write_all(b"OK\n");
-            let _ = stream.flush();
-
             let Some(connected) = keyboard.as_ref() else {
                 return;
             };
-            if let Err(error) = connected.send_profile_commands_fast(profile - 1) {
-                append_log(
-                    config_path,
-                    &format!("Immediate profile command failed after acknowledgement: {error:#}"),
-                );
-                return;
-            }
-            if let Err(error) = connected.finish_profile_switch(profile - 1, &config) {
-                append_log(
-                    config_path,
-                    &format!("Post-acknowledgement profile verification failed: {error:#}"),
-                );
+            match connected.activate_profile(profile - 1, &config) {
+                Ok(()) => {
+                    let _ = stream.write_all(b"OK\n");
+                    let _ = stream.flush();
+                }
+                Err(error) => {
+                    append_log(
+                        config_path,
+                        &format!("IPC profile application failed: {error:#}"),
+                    );
+                    let _ = writeln!(stream, "ERR {error:#}");
+                    let _ = stream.flush();
+                }
             }
         }
     }
@@ -704,6 +896,7 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
 
     let mut keyboard: Option<Keyboard> = None;
     let mut next_device_check = Instant::now();
+    let mut next_enforcement_check = Instant::now();
 
     while running.load(Ordering::SeqCst) {
         loop {
@@ -722,7 +915,12 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
                 keyboard = Keyboard::connect_first();
                 if let Some(connected) = keyboard.as_ref() {
                     let config = load_config(config_path)?;
-                    if let Err(error) = apply_and_verify(connected, &config, false) {
+                    if !config.enabled {
+                        append_log(
+                            config_path,
+                            "Keyboard connected; automatic switching is disabled",
+                        );
+                    } else if let Err(error) = apply_and_verify(connected, &config, false) {
                         append_log(
                             config_path,
                             &format!("Profile application failed: {error:#}"),
@@ -730,23 +928,28 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
                     } else {
                         append_log(config_path, "Keyboard connected; OS profile verified");
                     }
+                    next_enforcement_check =
+                        Instant::now() + Duration::from_millis(config.enforce_interval_ms);
                 }
             } else if let Some(connected) = keyboard.as_ref() {
-                match connected.current_profile() {
-                    Ok(_) if !enforce_override && !load_config(config_path)?.enforce => {}
-                    Ok(_) => {
-                        let config = load_config(config_path)?;
+                if connected.current_profile().is_ok() {
+                    let config = load_config(config_path)?;
+                    let enforcement_due = config.enabled
+                        && (enforce_override || config.enforce)
+                        && Instant::now() >= next_enforcement_check;
+                    if enforcement_due {
                         if let Err(error) = apply_and_verify(connected, &config, false) {
                             append_log(
                                 config_path,
                                 &format!("Profile enforcement failed: {error:#}"),
                             );
                         }
+                        next_enforcement_check =
+                            Instant::now() + Duration::from_millis(config.enforce_interval_ms);
                     }
-                    Err(_) => {
-                        append_log(config_path, "Keyboard disconnected");
-                        keyboard = None;
-                    }
+                } else {
+                    append_log(config_path, "Keyboard disconnected");
+                    keyboard = None;
                 }
             }
             next_device_check = Instant::now() + interval;
@@ -762,11 +965,13 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
 #[cfg(target_os = "windows")]
 fn startup_enabled() -> bool {
     use winreg::{RegKey, enums::HKEY_CURRENT_USER};
-    RegKey::predef(HKEY_CURRENT_USER)
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-        .ok()
-        .and_then(|key| key.get_value::<String, _>("Wooting Host Profile").ok())
-        .is_some()
+    else {
+        return false;
+    };
+    key.get_value::<String, _>("Wooting Switch").is_ok()
+        || key.get_value::<String, _>("Wooting Host Profile").is_ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -781,8 +986,10 @@ fn set_startup_enabled(enabled: bool, config_path: &Path) -> Result<()> {
             executable.display(),
             config_path.display()
         );
-        key.set_value("Wooting Host Profile", &command)?;
+        key.set_value("Wooting Switch", &command)?;
+        let _ = key.delete_value("Wooting Host Profile");
     } else {
+        let _ = key.delete_value("Wooting Switch");
         let _ = key.delete_value("Wooting Host Profile");
     }
     Ok(())
@@ -959,7 +1166,7 @@ mod legacy_custom_drawn_gui {
     impl eframe::App for ConfigApp {
         fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
             egui::CentralPanel::default().show(context, |ui| {
-                ui.heading("Wooting Host Profile");
+                ui.heading("Wooting Switch");
                 ui.label(format!(
                     "Choose the onboard profile this {} system should use.",
                     if cfg!(target_os = "macos") {
@@ -1060,7 +1267,7 @@ mod legacy_custom_drawn_gui {
             ..Default::default()
         };
         eframe::run_native(
-            "Wooting Host Profile",
+            "Wooting Switch",
             options,
             Box::new(move |_creation_context| Ok(Box::new(ConfigApp::new(config_path, config)))),
         )
@@ -1085,8 +1292,9 @@ fn run_native_config(config_path: &Path, mut config: Config) -> Result<()> {
         core::PCWSTR,
     };
 
-    let profiles = discover_profiles()?;
-    let title = wide("Wooting Host Profile");
+    let profiles = discover_profiles(&mut config);
+    save_config(config_path, &config)?;
+    let title = wide("Wooting Switch");
     let instruction = wide("Choose the profile for this Windows system");
     let content = wide(
         "Only configured onboard profiles are shown. The background watcher will apply the saved profile after sign-in, wake, reconnect, or a USB/KVM host switch.",
@@ -1190,12 +1398,51 @@ fn run_native_config(config_path: &Path, mut config: Config) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_native_config(_config_path: &Path, _config: Config) -> Result<()> {
-    bail!("open the Wooting Host Profile.app SwiftUI front end")
+    bail!("open the Wooting Switch.app SwiftUI front end")
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn run_native_config(_config_path: &Path, _config: Config) -> Result<()> {
     bail!("the native configuration UI supports Windows and macOS")
+}
+
+fn set_automatic_switching(path: &Path, config: &mut Config, enabled: bool) -> Result<()> {
+    config.enabled = enabled;
+    save_config(path, config)?;
+    if enabled {
+        if let Ok(profile) = config.configured_profile()
+            && !try_ipc_set(profile + 1)?
+            && let Some(keyboard) = Keyboard::connect_first()
+        {
+            apply_and_verify(&keyboard, config, false)?;
+        }
+        start_hidden_watcher(path)?;
+    }
+    Ok(())
+}
+
+fn set_enforcement(path: &Path, config: &mut Config, enabled: bool) -> Result<()> {
+    config.enforce = enabled;
+    save_config(path, config)
+}
+
+fn set_status_icon(path: &Path, config: &mut Config, visible: bool) -> Result<()> {
+    config.show_status_icon = visible;
+    save_config(path, config)
+}
+
+fn list_profiles(path: &Path, config: &mut Config, json: bool) -> Result<()> {
+    let profiles = discover_profiles(config);
+    save_config(path, config)?;
+    if json {
+        println!("{}", serde_json::to_string(&profiles)?);
+    } else {
+        for profile in profiles {
+            let active = if profile.active { " (active)" } else { "" };
+            println!("P{}: {}{active}", profile.index, profile.name);
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -1205,18 +1452,28 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Profiles { json }) => {
-            let profiles = discover_profiles()?;
-            if json {
-                println!("{}", serde_json::to_string(&profiles)?);
-            } else {
-                for profile in profiles {
-                    let active = if profile.active { " (active)" } else { "" };
-                    println!("P{}: {}{active}", profile.index, profile.name);
-                }
-            }
+            list_profiles(&path, &mut config, json)?;
         }
         Some(Command::StartupStatus) => {
             println!("{}", startup_enabled());
+        }
+        Some(Command::EnabledStatus) => {
+            println!("{}", config.enabled);
+        }
+        Some(Command::SetEnabled { state }) => {
+            set_automatic_switching(&path, &mut config, matches!(state, EnabledChoice::Enable))?;
+        }
+        Some(Command::EnforceStatus) => {
+            println!("{}", config.enforce);
+        }
+        Some(Command::SetEnforce { state }) => {
+            set_enforcement(&path, &mut config, matches!(state, EnabledChoice::Enable))?;
+        }
+        Some(Command::StatusIconStatus) => {
+            println!("{}", config.show_status_icon);
+        }
+        Some(Command::SetStatusIcon { state }) => {
+            set_status_icon(&path, &mut config, matches!(state, StatusIconChoice::Show))?;
         }
         Some(Command::Status) => {
             let keyboard = connect_required()?;
@@ -1268,7 +1525,8 @@ fn main() -> Result<()> {
                 StartupChoice::Enable => set_startup_enabled(true, &path)?,
                 StartupChoice::Disable => set_startup_enabled(false, &path)?,
             }
-            if !try_ipc_set(profile)?
+            if config.enabled
+                && !try_ipc_set(profile)?
                 && let Some(keyboard) = Keyboard::connect_first()
             {
                 apply_and_verify(&keyboard, &config, false)?;
@@ -1310,13 +1568,20 @@ mod tests {
     #[test]
     fn config_round_trips() {
         let config = Config {
+            enabled: true,
+            show_status_icon: true,
             profiles: Profiles {
                 windows: Some(2),
                 macos: Some(1),
             },
+            profile_names: BTreeMap::from([
+                (1, "Typing Profile".to_owned()),
+                (2, "Game Profile".to_owned()),
+            ]),
             refresh_lighting: true,
             command_delay_ms: 250,
             enforce: false,
+            enforce_interval_ms: 5_000,
         };
         let text = toml::to_string(&config).expect("serialize config");
         let decoded: Config = toml::from_str(&text).expect("parse config");

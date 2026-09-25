@@ -1,18 +1,24 @@
+import AppKit
+import Darwin
 import SwiftUI
 
 struct KeyboardProfile: Codable, Identifiable, Hashable {
     let index: Int
     let name: String
     let active: Bool
+    let assigned: Bool?
     var id: Int { index }
 }
 
 @MainActor
 final class ProfileModel: ObservableObject {
     @Published var profiles: [KeyboardProfile] = []
-    @Published var selectedProfile: Int = 0
+    @Published var selectedProfile = 0
+    @Published var automaticSwitching = true
+    @Published var keepProfileActive = false
     @Published var startAtLogin = true
-    @Published var status = "Reading Wootility profiles…"
+    @Published var hideStatusIcon = false
+    @Published var status = ""
     @Published var busy = false
 
     private var agentURL: URL {
@@ -33,31 +39,35 @@ final class ProfileModel: ObservableObject {
         let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             throw NSError(
-                domain: "WootingHostProfile",
+                domain: "WootingSwitch",
                 code: Int(process.terminationStatus),
                 userInfo: [NSLocalizedDescriptionKey: stderr.isEmpty ? "The background agent failed." : stderr]
             )
         }
-        return stdout
+        return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func refresh() {
         busy = true
-        status = "Reading configured profiles…"
+        status = ""
         Task {
             do {
-                let startup = try runAgent(["startup-status"])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                startAtLogin = startup == "true"
+                startAtLogin = try runAgent(["startup-status"]) == "true"
+                automaticSwitching = try runAgent(["enabled-status"]) == "true"
+                keepProfileActive = try runAgent(["enforce-status"]) == "true"
+                hideStatusIcon = try runAgent(["status-icon-status"]) != "true"
+                applyStatusIconVisibility()
+
                 let json = try runAgent(["profiles", "--json"])
                 let decoded = try JSONDecoder().decode([KeyboardProfile].self, from: Data(json.utf8))
                 profiles = decoded
-                if let active = decoded.first(where: { $0.active }) {
-                    selectedProfile = active.index
-                } else if let first = decoded.first {
-                    selectedProfile = first.index
+                selectedProfile = decoded.first(where: { $0.assigned == true })?.index
+                    ?? decoded.first(where: { $0.active })?.index
+                    ?? decoded.first?.index
+                    ?? 0
+                if decoded.isEmpty {
+                    status = "No configured onboard profiles found."
                 }
-                status = decoded.isEmpty ? "No configured onboard profiles found." : "Choose the macOS profile."
             } catch {
                 profiles = []
                 status = error.localizedDescription
@@ -66,13 +76,16 @@ final class ProfileModel: ObservableObject {
         }
     }
 
-    func applyNow() {
+    func remember() {
         guard selectedProfile > 0 else { return }
         busy = true
+        status = ""
         Task {
             do {
-                _ = try runAgent(["set", "--profile", String(selectedProfile)])
-                status = "Applied and verified P\(selectedProfile)."
+                _ = try runAgent([
+                    "configure", "--profile", String(selectedProfile),
+                    "--startup", "keep"
+                ])
                 refresh()
             } catch {
                 status = error.localizedDescription
@@ -81,100 +94,179 @@ final class ProfileModel: ObservableObject {
         }
     }
 
-    func saveAndRun() {
-        guard selectedProfile > 0 else { return }
+    func setAutomaticSwitching(_ enabled: Bool) {
+        guard !busy else { return }
+        update(["set-enabled", enabled ? "enable" : "disable"])
+    }
+
+    func setEnforcement(_ enabled: Bool) {
+        guard !busy else { return }
+        update(["set-enforce", enabled ? "enable" : "disable"])
+    }
+
+    func setStartup(_ enabled: Bool) {
+        guard !busy, selectedProfile > 0 else { return }
+        update([
+            "configure", "--profile", String(selectedProfile),
+            "--startup", enabled ? "enable" : "disable"
+        ])
+    }
+
+    func setStatusIconHidden(_ hidden: Bool) {
+        guard !busy else { return }
+        update(["set-status-icon", hidden ? "hide" : "show"]) { [weak self] in
+            self?.applyStatusIconVisibility()
+        }
+    }
+
+    private func update(_ arguments: [String], completion: (() -> Void)? = nil) {
         busy = true
+        status = ""
         Task {
             do {
-                let startup = startAtLogin ? "enable" : "disable"
-                _ = try runAgent([
-                    "configure", "--profile", String(selectedProfile),
-                    "--startup", startup
-                ])
-                status = "Saved P\(selectedProfile). The hidden watcher is running."
+                _ = try runAgent(arguments)
+                completion?()
             } catch {
                 status = error.localizedDescription
             }
             busy = false
         }
     }
+
+    private func applyStatusIconVisibility() {
+        NSApp.setActivationPolicy(hideStatusIcon ? .accessory : .regular)
+    }
 }
 
 struct ContentView: View {
     @StateObject private var model = ProfileModel()
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Wooting Host Profile")
-                    .font(.title2.bold())
-                Text("Choose the configured onboard profile this Mac should use.")
-                    .foregroundStyle(.secondary)
-            }
+    private let canvas = Color(red: 24 / 255, green: 26 / 255, blue: 27 / 255)
+    private let surface = Color(red: 32 / 255, green: 36 / 255, blue: 38 / 255)
+    private let border = Color(red: 52 / 255, green: 58 / 255, blue: 61 / 255)
+    private let text = Color(red: 232 / 255, green: 235 / 255, blue: 237 / 255)
+    private let muted = Color(red: 166 / 255, green: 173 / 255, blue: 181 / 255)
+    private let accent = Color(red: 255 / 255, green: 212 / 255, blue: 92 / 255)
 
-            GroupBox("Configured profiles") {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.profiles) { profile in
-                        Toggle(isOn: Binding(
-                            get: { model.selectedProfile == profile.index },
-                            set: { if $0 { model.selectedProfile = profile.index } }
-                        )) {
-                            HStack {
-                                Text("P\(profile.index) — \(profile.name)")
-                                if profile.active {
-                                    Text("Active now")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .toggleStyle(.radio)
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            canvas.ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 11) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("macOS profile")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(text)
+                        Text("Choose the profile for this Mac")
+                            .font(.system(size: 11))
+                            .foregroundStyle(muted)
+                    }
+                    Spacer()
+                    if model.busy {
+                        ProgressView().controlSize(.small).tint(accent)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
-            }
 
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Avoid app-specific profile overrides").bold()
-                    Text("Do not enable Wootility App Linking or another profile switcher. It can replace the system profile selected here.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Picker("", selection: $model.selectedProfile) {
+                        ForEach(model.profiles) { profile in
+                            HStack {
+                                Text("P\(profile.index)")
+                                Text(profile.name)
+                                if profile.active {
+                                    Text("ACTIVE")
+                                }
+                            }
+                            .tag(profile.index)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
+
+                    Button("Remember") { model.remember() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(accent)
+                        .foregroundStyle(Color.black)
+                        .frame(height: 36)
+                        .disabled(model.busy || model.selectedProfile == 0)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Switch profiles automatically", isOn: $model.automaticSwitching)
+                        .onChange(of: model.automaticSwitching) { model.setAutomaticSwitching($0) }
+
+                    Toggle(isOn: $model.keepProfileActive) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("Keep this profile active")
+                            Text("Checks every 5 seconds")
+                                .font(.system(size: 10))
+                                .foregroundStyle(muted)
+                        }
+                    }
+                    .onChange(of: model.keepProfileActive) { model.setEnforcement($0) }
+
+                    Toggle("Open at sign-in", isOn: $model.startAtLogin)
+                        .onChange(of: model.startAtLogin) { model.setStartup($0) }
+
+                    Toggle("Hide Dock/menu icon", isOn: $model.hideStatusIcon)
+                        .onChange(of: model.hideStatusIcon) { model.setStatusIconHidden($0) }
+                }
+                .toggleStyle(.checkbox)
+                .foregroundStyle(text)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(surface, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(border, lineWidth: 1))
+
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(accent)
+                    Text("Wooting’s app-profile syncing may conflict with this app.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(muted)
                 }
             }
-            .padding(10)
-            .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 12)
 
-            Toggle("Start the watcher hidden when I sign in", isOn: $model.startAtLogin)
-
-            HStack {
-                Button("Refresh") { model.refresh() }
-                Button("Apply Now") { model.applyNow() }
-                    .disabled(model.busy || model.selectedProfile == 0)
-                Spacer()
-                Button("Save and Run in Background") { model.saveAndRun() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.busy || model.selectedProfile == 0)
+            if !model.status.isEmpty {
+                Text(model.status)
+                    .font(.system(size: 11))
+                    .foregroundStyle(text)
+                    .lineLimit(2)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(red: 48 / 255, green: 53 / 255, blue: 56 / 255))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent, lineWidth: 1))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .padding(16)
             }
-
-            Text(model.status)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
         }
-        .padding(16)
-        .frame(width: 480, height: 380)
+        .frame(width: 460)
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear { model.refresh() }
     }
 }
 
 @main
-struct WootingHostProfileApp: App {
+struct WootingSwitchApp: App {
+    init() {
+        let bundleIdentifier = "io.local.wooting-host-profile"
+        let currentProcess = ProcessInfo.processInfo.processIdentifier
+        if let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+            .first(where: { $0.processIdentifier != currentProcess }) {
+            existing.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            exit(0)
+        }
+    }
+
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("Wooting Switch") {
             ContentView()
         }
         .windowResizability(.contentSize)

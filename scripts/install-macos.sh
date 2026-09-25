@@ -12,7 +12,7 @@ if [ ! -x "$binary" ]; then
   (cd "$project_dir" && cargo build --release)
 fi
 
-app_dir="$HOME/Applications/Wooting Host Profile.app"
+app_dir="$HOME/Applications/Wooting Switch.app"
 contents="$app_dir/Contents"
 macos_dir="$contents/MacOS"
 resources_dir="$contents/Resources"
@@ -34,7 +34,7 @@ cat > "$contents/Info.plist" <<'EOF'
 <plist version="1.0">
 <dict>
   <key>CFBundleDisplayName</key>
-  <string>Wooting Host Profile</string>
+  <string>Wooting Switch</string>
   <key>CFBundleExecutable</key>
   <string>WootingHostProfile</string>
   <key>CFBundleIdentifier</key>
@@ -42,7 +42,7 @@ cat > "$contents/Info.plist" <<'EOF'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleName</key>
-  <string>Wooting Host Profile</string>
+  <string>Wooting Switch</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -57,4 +57,4 @@ EOF
 
 open "$app_dir"
 echo "Installed and opened $app_dir"
-echo "Choose a profile, optionally enable startup, then select Save and run in background."
+echo "Choose a profile or option; changes apply immediately."

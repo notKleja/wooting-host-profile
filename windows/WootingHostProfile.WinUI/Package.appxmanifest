@@ -17,7 +17,7 @@
   <mp:PhoneIdentity PhoneProductId="A293FC41-AE86-46B1-9444-5559568F019C" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
   <Properties>
-    <DisplayName>WootingHostProfile.WinUI</DisplayName>
+    <DisplayName>Wooting Switch</DisplayName>
     <PublisherDisplayName>AppPublisher</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <uap10:PackageIntegrity>
@@ -39,8 +39,8 @@
       Executable="$targetnametoken$.exe"
       EntryPoint="$targetentrypoint$">
       <uap:VisualElements
-        DisplayName="WootingHostProfile.WinUI"
-        Description="WootingHostProfile.WinUI"
+        DisplayName="Wooting Switch"
+        Description="Choose and maintain a Wooting keyboard profile"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">

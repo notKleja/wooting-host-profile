@@ -1,4 +1,4 @@
-# Wooting Host Profile
+# Wooting Switch
 
 A small platform-native configuration app and completely hidden background
 watcher for choosing one Wooting onboard profile on Windows and another on
@@ -13,19 +13,24 @@ telemetry, or the network at runtime.
 Windows uses WinUI 3/XAML and Fluent controls. macOS uses SwiftUI. Both front
 ends call the same Rust USB/background core.
 
-Open **Wooting Host Profile** normally. The window:
+Open **Wooting Switch** normally. The window:
 
 - lists only the onboard profiles actually configured in Wootility;
 - shows their Wootility names, such as `Typing Profile` and `mac profile`;
-- marks the profile currently active on the connected keyboard;
-- lets you select the profile assigned to the current operating system;
-- can apply and verify the selection immediately;
-- can enable a fully hidden watcher at sign-in;
+- selects the operating-system profile from one compact dropdown;
+- saves and applies that selection with the adjacent **Remember** button;
+- can disable automatic switching without stopping the app;
+- can periodically restore the selected profile after a safe cooldown;
+- can enable the fully hidden watcher at sign-in;
+- can hide its Windows tray or macOS Dock/menu icon;
 - explains that Wootility App Linking and other app-specific profile overrides
   should remain disabled because they can override the system profile.
 
-The Windows window has a fixed compact 540×520 layout. Minimizing or closing it
-hides it from the taskbar while keeping it in the Windows notification area.
+The Windows window opens at a compact preferred width and the final rendered
+content height. Those values become its minimum size; the window may be made
+larger, while content stretches with the available width and scrolls only when
+the display work area cannot fit it. Minimizing or closing it hides it from the
+taskbar while keeping it in the Windows notification area.
 Left-click the custom `P` tray icon to reopen it, or right-click it for **Open**
 and **Exit**. At sign-in the WinUI app can start directly in tray mode.
 
@@ -39,16 +44,17 @@ on a fully opaque near-black `#09090B` tile. Transparency is used only outside
 the rounded-square silhouette—there are no translucent shadows, gradients,
 glows, or highlights.
 
-Profile names are read offline from Wootility Web's Chromium local-storage
-cache. The app copies that database to a temporary directory before reading it,
-so Chrome, Edge, or Brave may remain open. Open `wootility.io` and connect the
-keyboard at least once before configuring this app. The hidden watcher does not
-need the browser cache after a profile has been selected.
+Profile names and populated onboard slots are read directly from keyboard
+metadata. If a keyboard or firmware does not expose that metadata, the app
+falls back to Wootility Web's Chromium cache, then its own persisted last-known
+names, and finally usable generic P1-P4 labels. The UI and watcher therefore do
+not require a browser, Wootility, or network access for supported keyboards.
 
 ## Background behavior
 
-The watcher starts with the user session and waits for the keyboard. When the
-keyboard appears after startup, wake, reconnect, or a USB/KVM host switch, it:
+When automatic switching is enabled, the watcher starts with the user session
+and waits for the keyboard. When the keyboard appears after startup, wake,
+reconnect, or a USB/KVM host switch, it:
 
 1. reads the active onboard profile;
 2. loads the profile selected for Windows or macOS;
@@ -59,14 +65,15 @@ keyboard appears after startup, wake, reconnect, or a USB/KVM host switch, it:
 The watcher keeps the HID connection warm and exposes a loopback-only local
 control channel on `127.0.0.1:50053`. The Fluent UI sends profile selections to
 that persistent process instead of starting a fresh USB discovery operation.
-Profile commands are acknowledged locally as soon as they are dispatched to
-the HID transport, then verified in the watcher. On the tested 60HE+, packaged
-P1/P2 requests complete through the UI command path in roughly 24–37 ms. USB
-reconnect detection runs every 100 ms instead of every two seconds.
+The watcher acknowledges a selection only after the keyboard has accepted the
+profile and lighting commands and the active profile index has been read back.
+USB reconnect detection runs every 100 ms instead of every two seconds.
 
 Only one watcher instance can run. Configuration is reloaded while it runs, so
 changing the selection in the GUI does not require restarting the watcher.
 Diagnostic events are written to `watch.log` beside the configuration file.
+The native UI is also single-instance. Launching it again foregrounds the
+existing window, including when its tray, Dock, or menu icon is hidden.
 
 ## Windows installation
 
@@ -97,7 +104,7 @@ chmod +x ./scripts/install-macos.sh
 ```
 
 The helper compiles the shared Rust agent and the native SwiftUI front end,
-creates `~/Applications/Wooting Host Profile.app`, and opens it. When enabled
+creates `~/Applications/Wooting Switch.app`, and opens it. When enabled
 in the GUI, the agent creates a per-user LaunchAgent for the invisible watcher.
 
 The macOS build is intentionally local and unsigned. The source is identical
@@ -114,6 +121,15 @@ wooting-host-profile status
 wooting-host-profile profiles
 wooting-host-profile profiles --json
 wooting-host-profile startup-status
+wooting-host-profile enabled-status
+wooting-host-profile set-enabled enable
+wooting-host-profile set-enabled disable
+wooting-host-profile enforce-status
+wooting-host-profile set-enforce enable
+wooting-host-profile set-enforce disable
+wooting-host-profile status-icon-status
+wooting-host-profile set-status-icon show
+wooting-host-profile set-status-icon hide
 wooting-host-profile learn
 wooting-host-profile learn --profile 2
 wooting-host-profile apply
@@ -130,9 +146,12 @@ The configuration uses human-facing profile numbers. Only configured profile
 slots are offered by the native UI:
 
 ```toml
+enabled = true
+show_status_icon = true
 refresh_lighting = true
 command_delay_ms = 250
 enforce = false
+enforce_interval_ms = 5000
 
 [profiles]
 windows = 2

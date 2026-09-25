@@ -16,15 +16,30 @@ public sealed class ProfileInfo
     [JsonPropertyName("active")]
     public bool Active { get; set; }
 
-    public string DisplayName => Active
-        ? $"P{Index} — {Name}   ·   Active now"
-        : $"P{Index} — {Name}";
+    [JsonPropertyName("assigned")]
+    public bool Assigned { get; set; }
+
+    public string DisplayName => $"P{Index} — {Name}";
+
+    public string SlotLabel => $"P{Index}";
+
+    public string ActiveLabel => Active ? "ACTIVE" : string.Empty;
+
+    public string StateText => (Active, Assigned) switch
+    {
+        (true, true) => "ACTIVE · WINDOWS DEFAULT",
+        (true, false) => "ACTIVE",
+        (false, true) => "WINDOWS DEFAULT",
+        _ => string.Empty,
+    };
+
 }
 
 public static class AgentService
 {
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    private const string RunValue = "Wooting Host Profile";
+    private const string RunValue = "Wooting Switch";
+    private const string LegacyRunValue = "Wooting Host Profile";
 
     public static string AgentPath => Path.Combine(AppContext.BaseDirectory, "wooting-host-profile-agent.exe");
 
@@ -72,9 +87,37 @@ public static class AgentService
             ?? throw new InvalidOperationException("The agent returned no profile list.");
     }
 
-    public static async Task ApplyAsync(int profile)
+    public static async Task<bool> IsAppEnabledAsync()
     {
-        _ = await RunAsync("set", "--profile", profile.ToString());
+        string enabled = await RunAsync("enabled-status");
+        return bool.TryParse(enabled, out bool result) && result;
+    }
+
+    public static async Task SetAppEnabledAsync(bool enabled)
+    {
+        _ = await RunAsync("set-enabled", enabled ? "enable" : "disable");
+    }
+
+    public static async Task<bool> IsEnforcementEnabledAsync()
+    {
+        string enabled = await RunAsync("enforce-status");
+        return bool.TryParse(enabled, out bool result) && result;
+    }
+
+    public static async Task SetEnforcementEnabledAsync(bool enabled)
+    {
+        _ = await RunAsync("set-enforce", enabled ? "enable" : "disable");
+    }
+
+    public static async Task<bool> IsStatusIconVisibleAsync()
+    {
+        string visible = await RunAsync("status-icon-status");
+        return bool.TryParse(visible, out bool result) && result;
+    }
+
+    public static async Task SetStatusIconVisibleAsync(bool visible)
+    {
+        _ = await RunAsync("set-status-icon", visible ? "show" : "hide");
     }
 
     public static async Task ConfigureAsync(int profile, bool startAtLogin)
@@ -93,8 +136,18 @@ public static class AgentService
 
     public static bool IsStartupEnabled()
     {
-        using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKey);
-        return key?.GetValue(RunValue) is string;
+        using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
+        if (key?.GetValue(RunValue) is string)
+        {
+            return true;
+        }
+        if (key?.GetValue(LegacyRunValue) is string legacyCommand)
+        {
+            key.SetValue(RunValue, legacyCommand, RegistryValueKind.String);
+            key.DeleteValue(LegacyRunValue, throwOnMissingValue: false);
+            return true;
+        }
+        return false;
     }
 
     public static void SetStartupEnabled(bool enabled)
@@ -105,10 +158,12 @@ public static class AgentService
             string executable = Environment.ProcessPath
                 ?? throw new InvalidOperationException("Could not resolve the WinUI application path.");
             key.SetValue(RunValue, $"\"{executable}\" --tray", RegistryValueKind.String);
+            key.DeleteValue(LegacyRunValue, throwOnMissingValue: false);
         }
         else
         {
             key.DeleteValue(RunValue, throwOnMissingValue: false);
+            key.DeleteValue(LegacyRunValue, throwOnMissingValue: false);
         }
     }
 }
