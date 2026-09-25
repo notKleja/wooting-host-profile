@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "WootingHostProfile.WinUI (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "WootingHostProfile.WinUI (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+/target/
+/dist/
+/agent/
+**/bin/
+**/obj/
+.vs/
+*.tmp
