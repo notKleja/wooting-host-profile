@@ -2,6 +2,23 @@ import AppKit
 import Darwin
 import SwiftUI
 
+private final class AgentOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
+
+    func store(_ data: Data) {
+        lock.lock()
+        storage = data
+        lock.unlock()
+    }
+
+    var data: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 struct KeyboardProfile: Codable, Identifiable, Hashable {
     let index: Int
     let name: String
@@ -13,6 +30,7 @@ struct KeyboardProfile: Codable, Identifiable, Hashable {
 @MainActor
 final class ProfileModel: ObservableObject {
     @Published var profiles: [KeyboardProfile] = []
+    @Published var linkedProfileCount: Int?
     @Published var selectedProfile = 0
     @Published var automaticSwitching = true
     @Published var keepProfileActive = false
@@ -25,40 +43,132 @@ final class ProfileModel: ObservableObject {
         Bundle.main.resourceURL!.appendingPathComponent("wooting-host-profile-agent")
     }
 
-    func runAgent(_ arguments: [String]) throws -> String {
+    var selectedProfileInfo: KeyboardProfile? {
+        profiles.first(where: { $0.index == selectedProfile })
+    }
+
+    var rememberTitle: String {
+        guard let profile = selectedProfileInfo else { return "Remember & activate" }
+        if profile.active && profile.assigned == true { return "Up to date" }
+        if profile.assigned == true { return "Activate" }
+        return "Remember & activate"
+    }
+
+    var canRemember: Bool {
+        guard let profile = selectedProfileInfo else { return false }
+        return !busy && !(profile.active && profile.assigned == true)
+    }
+
+    var appLinkingStatus: String {
+        guard let count = linkedProfileCount else {
+            return "Wootility App Linking status is unavailable."
+        }
+        return count == 0
+            ? "Wootility App Linking: no linked profiles detected."
+            : "Conflict detected: \(count) Wootility linked profile(s) can override this app."
+    }
+
+    var appLinkingHasConflict: Bool {
+        (linkedProfileCount ?? 0) > 0
+    }
+
+    var appLinkingStatusIcon: String {
+        guard linkedProfileCount != nil else { return "info.circle" }
+        return appLinkingHasConflict ? "exclamationmark.triangle" : "checkmark.circle"
+    }
+
+    func runAgent(_ arguments: [String]) async throws -> String {
+        let executableURL = agentURL
+        return try await Task.detached(priority: .userInitiated) {
+            try Self.runAgentBlocking(executableURL, arguments: arguments)
+        }.value
+    }
+
+    nonisolated private static func runAgentBlocking(_ executableURL: URL, arguments: [String]) throws -> String {
         let process = Process()
         let output = Pipe()
         let errors = Pipe()
-        process.executableURL = agentURL
+        let stdout = AgentOutput()
+        let stderr = AgentOutput()
+        let readers = DispatchGroup()
+        let exited = DispatchSemaphore(value: 0)
+        process.executableURL = executableURL
         process.arguments = arguments
         process.standardOutput = output
         process.standardError = errors
+
+        process.terminationHandler = { _ in exited.signal() }
         try process.run()
-        process.waitUntilExit()
-        let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        // Drain both pipes concurrently. If either pipe fills, the child can
+        // block before it exits; reading them serially would deadlock.
+        readers.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stdout.store(output.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+        readers.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stderr.store(errors.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+
+        let timeout: TimeInterval = 30
+        guard exited.wait(timeout: .now() + timeout) == .success else {
+            process.terminate()
+            // Give the child a short grace period, then force termination if it
+            // ignored SIGTERM. The second wait is bounded as well.
+            if exited.wait(timeout: .now() + 2) != .success {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + 2)
+            }
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
+            throw NSError(
+                domain: "WootingSwitch",
+                code: Int(ETIMEDOUT),
+                userInfo: [NSLocalizedDescriptionKey: "The background agent timed out and was terminated."]
+            )
+        }
+
+        // A descendant may inherit a pipe and keep it open after the agent exits.
+        // Bound that wait too, so the UI cannot remain stuck indefinitely.
+        guard readers.wait(timeout: .now() + 2) == .success else {
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
+            throw NSError(
+                domain: "WootingSwitch",
+                code: Int(ETIMEDOUT),
+                userInfo: [NSLocalizedDescriptionKey: "The background agent left an output pipe open."]
+            )
+        }
+        try? output.fileHandleForReading.close()
+        try? errors.fileHandleForReading.close()
+        let stdoutText = String(data: stdout.data, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderr.data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             throw NSError(
                 domain: "WootingSwitch",
                 code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: stderr.isEmpty ? "The background agent failed." : stderr]
+                userInfo: [NSLocalizedDescriptionKey: stderrText.isEmpty ? "The background agent failed." : stderrText]
             )
         }
-        return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func refresh() {
+    func refresh(successMessage: String? = nil) {
         busy = true
         status = ""
         Task {
             do {
-                startAtLogin = try runAgent(["startup-status"]) == "true"
-                automaticSwitching = try runAgent(["enabled-status"]) == "true"
-                keepProfileActive = try runAgent(["enforce-status"]) == "true"
-                hideStatusIcon = try runAgent(["status-icon-status"]) != "true"
+                startAtLogin = try await runAgent(["startup-status"]) == "true"
+                automaticSwitching = try await runAgent(["enabled-status"]) == "true"
+                keepProfileActive = try await runAgent(["enforce-status"]) == "true"
+                hideStatusIcon = try await runAgent(["status-icon-status"]) != "true"
+                linkedProfileCount = Int(try await runAgent(["linked-status"]))
                 applyStatusIconVisibility()
 
-                let json = try runAgent(["profiles", "--json"])
+                let json = try await runAgent(["profiles", "--json"])
                 let decoded = try JSONDecoder().decode([KeyboardProfile].self, from: Data(json.utf8))
                 profiles = decoded
                 selectedProfile = decoded.first(where: { $0.assigned == true })?.index
@@ -67,6 +177,10 @@ final class ProfileModel: ObservableObject {
                     ?? 0
                 if decoded.isEmpty {
                     status = "No configured onboard profiles found."
+                } else if !decoded.contains(where: { $0.active }) {
+                    status = "Keyboard status unavailable. Showing saved profile information."
+                } else if let successMessage {
+                    status = successMessage
                 }
             } catch {
                 profiles = []
@@ -78,15 +192,20 @@ final class ProfileModel: ObservableObject {
 
     func remember() {
         guard selectedProfile > 0 else { return }
+        let profile = selectedProfileInfo
+        let wasAssigned = profile?.assigned == true
+        let profileIndex = selectedProfile
         busy = true
         status = ""
         Task {
             do {
-                _ = try runAgent([
-                    "configure", "--profile", String(selectedProfile),
+                _ = try await runAgent([
+                    "configure", "--profile", String(profileIndex),
                     "--startup", "keep"
                 ])
-                refresh()
+                refresh(successMessage: wasAssigned
+                    ? "P\(profileIndex) activated and verified."
+                    : "P\(profileIndex) saved for macOS and verified.")
             } catch {
                 status = error.localizedDescription
                 busy = false
@@ -124,7 +243,7 @@ final class ProfileModel: ObservableObject {
         status = ""
         Task {
             do {
-                _ = try runAgent(arguments)
+                _ = try await runAgent(arguments)
                 completion?()
             } catch {
                 status = error.localizedDescription
@@ -158,7 +277,7 @@ struct ContentView: View {
                         Text("macOS profile")
                             .font(.system(size: 18, weight: .semibold))
                             .foregroundStyle(text)
-                        Text("Choose the profile for this Mac")
+                        Text("\(model.profiles.count) / 4 onboard profiles")
                             .font(.system(size: 11))
                             .foregroundStyle(muted)
                     }
@@ -174,8 +293,12 @@ struct ContentView: View {
                             HStack {
                                 Text("P\(profile.index)")
                                 Text(profile.name)
-                                if profile.active {
+                                if profile.active && profile.assigned == true {
+                                    Text("ACTIVE · MAC DEFAULT")
+                                } else if profile.active {
                                     Text("ACTIVE")
+                                } else if profile.assigned == true {
+                                    Text("MAC DEFAULT")
                                 }
                             }
                             .tag(profile.index)
@@ -185,12 +308,12 @@ struct ContentView: View {
                     .pickerStyle(.menu)
                     .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
 
-                    Button("Remember") { model.remember() }
+                    Button(model.rememberTitle) { model.remember() }
                         .buttonStyle(.borderedProminent)
                         .tint(accent)
                         .foregroundStyle(Color.black)
                         .frame(height: 36)
-                        .disabled(model.busy || model.selectedProfile == 0)
+                        .disabled(!model.canRemember)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -221,10 +344,10 @@ struct ContentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(border, lineWidth: 1))
 
                 HStack(alignment: .top, spacing: 7) {
-                    Image(systemName: "exclamationmark.triangle")
+                    Image(systemName: model.appLinkingStatusIcon)
                         .font(.system(size: 11))
-                        .foregroundStyle(accent)
-                    Text("Wooting’s app-profile syncing may conflict with this app.")
+                        .foregroundStyle(model.appLinkingHasConflict ? accent : muted)
+                    Text(model.appLinkingStatus)
                         .font(.system(size: 10))
                         .foregroundStyle(muted)
                 }

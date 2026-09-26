@@ -60,9 +60,10 @@
                             FontWeight="SemiBold"
                             Text="Windows profile" />
                         <TextBlock
+                            x:Name="ProfileSummaryText"
                             Foreground="{StaticResource MutedBrush}"
                             FontSize="11"
-                            Text="Choose the profile for this PC" />
+                            Text="Loading onboard profiles…" />
                     </StackPanel>
                     <ProgressRing
                         x:Name="LoadingRing"
@@ -117,7 +118,7 @@
                                         Foreground="{StaticResource AccentBrush}"
                                         FontSize="9"
                                         FontWeight="SemiBold"
-                                        Text="{x:Bind ActiveLabel}" />
+                                        Text="{x:Bind StateText}" />
                                 </Grid>
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
@@ -188,11 +189,12 @@
                         FontSize="11"
                         Glyph="&#xE7BA;" />
                     <TextBlock
+                        x:Name="AppLinkingText"
                         Grid.Column="1"
                         VerticalAlignment="Top"
                         Foreground="{StaticResource MutedBrush}"
                         FontSize="10"
-                        Text="Wooting’s app-profile syncing may conflict with this app."
+                        Text="Checking Wootility App Linking…"
                         TextWrapping="Wrap" />
                 </Grid>
             </Grid>

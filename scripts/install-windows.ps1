@@ -1,5 +1,11 @@
 $ErrorActionPreference = 'Stop'
-$sourceDirectory = Join-Path $PSScriptRoot '..\dist\windows'
+$releaseDirectory = Join-Path $PSScriptRoot 'app'
+$repositoryDirectory = Join-Path $PSScriptRoot '..\dist\windows'
+$sourceDirectory = if (Test-Path -LiteralPath (Join-Path $releaseDirectory 'WootingHostProfile.WinUI.exe')) {
+    $releaseDirectory
+} else {
+    $repositoryDirectory
+}
 $installDirectory = Join-Path $env:LOCALAPPDATA 'WootingHostProfile'
 $executable = Join-Path $installDirectory 'WootingHostProfile.WinUI.exe'
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
@@ -11,8 +17,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $sourceDirectory 'WootingHostProfile
 }
 
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
-Get-Process -Name 'WootingHostProfile.WinUI','wooting-host-profile-agent' -ErrorAction SilentlyContinue | Stop-Process
-Start-Sleep -Milliseconds 300
+$runningProcesses = @(Get-Process -Name 'WootingHostProfile.WinUI','wooting-host-profile-agent' -ErrorAction SilentlyContinue)
+if ($runningProcesses.Count -gt 0) {
+    $runningProcesses | Stop-Process
+    $runningProcesses | Wait-Process -Timeout 5 -ErrorAction Stop
+}
 Copy-Item -Path (Join-Path $sourceDirectory '*') -Destination $installDirectory -Recurse -Force
 
 $shell = New-Object -ComObject WScript.Shell

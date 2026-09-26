@@ -1,7 +1,7 @@
 # Build and verification notes
 
-Version 0.4.0 was verified on Windows against a connected Wooting 60HE+ on
-2026-09-25.
+Version 0.5.0 was built and verified on Windows on 2026-09-26. The core HID
+switching path was previously verified against a connected Wooting 60HE+.
 
 ## Profile enumeration
 
@@ -59,8 +59,11 @@ those names locally for future offline fallback.
   250 ms sleeps, and waited synchronously for every HID acknowledgement.
 - Profile validation was removed from the switching hot path; the UI already
   supplies a profile returned by enumeration.
-- The watcher now keeps the HID device selected and accepts loopback-only IPC
-  commands on `127.0.0.1:50053`.
+- The watcher keeps the HID device selected and accepts authenticated,
+  configuration-scoped loopback IPC commands with bounded framing and timeouts.
+- Profile enumeration is routed through the watcher while it owns HID, and a
+  per-user device lock prevents competing Wooting Switch processes.
+- Configuration updates use cross-process locking and atomic replacement.
 - Modern switching waits for acknowledgements in the sequence WootDevInit (33),
   ActivateProfile (23), 100 ms settle, and ReloadProfile (38), then verifies the
   heartbeat state and releases WootDev ownership with command 32. Command 7 and
@@ -74,12 +77,13 @@ those names locally for future offline fallback.
 
 ## Code quality
 
-- Three Rust unit tests passed.
+- Ten Rust unit tests passed.
 - `cargo fmt --check` passed.
 - `cargo clippy --release -- -D warnings` passed.
 - The optimized Rust release build completed successfully.
 - The WinUI project built and published successfully.
 - The Windows installer parsed and installed successfully.
+- The release and packaged-agent SHA-256 hashes matched.
 
 The upstream `wooting-rgb-sys` static library emits Microsoft linker LNK4217
 warnings. They do not prevent compilation or the tested USB/profile operations.

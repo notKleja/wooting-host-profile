@@ -4,8 +4,9 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     fs::{self, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::{
@@ -13,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,7 +36,16 @@ const RELOAD_PROFILE: u8 = 38;
 const GET_PROFILE_METADATA: u8 = 55;
 const HEARTBEAT: u8 = 73;
 const PROFILE_COUNT: u8 = 4;
-const IPC_ADDRESS: &str = "127.0.0.1:50053";
+const IPC_PORT_BASE: u16 = 49_152;
+const IPC_PORT_COUNT: u16 = 16_384;
+const IPC_REQUEST_LIMIT: u64 = 128;
+const MAX_PROFILE_NAME_BYTES: usize = 256;
+const MIN_COMMAND_DELAY_MS: u64 = 10;
+const MAX_COMMAND_DELAY_MS: u64 = 5_000;
+const MIN_ENFORCE_INTERVAL_MS: u64 = 1_000;
+const MAX_ENFORCE_INTERVAL_MS: u64 = 3_600_000;
+const MAX_LOG_BYTES: u64 = 1_048_576;
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
@@ -55,6 +65,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Report how many Wootility App Linking profiles are configured.
+    LinkedStatus,
 
     /// Report whether the hidden watcher is registered to start at login.
     StartupStatus,
@@ -216,6 +229,31 @@ const fn default_enforce_interval_ms() -> u64 {
 }
 
 impl Config {
+    fn validate(&self) -> Result<()> {
+        if let Some(profile) = self.profiles.windows {
+            validate_human_profile(profile).context("invalid Windows profile in configuration")?;
+        }
+        if let Some(profile) = self.profiles.macos {
+            validate_human_profile(profile).context("invalid macOS profile in configuration")?;
+        }
+        if !(MIN_COMMAND_DELAY_MS..=MAX_COMMAND_DELAY_MS).contains(&self.command_delay_ms) {
+            bail!(
+                "command_delay_ms must be between {MIN_COMMAND_DELAY_MS} and {MAX_COMMAND_DELAY_MS}"
+            )
+        }
+        if !(MIN_ENFORCE_INTERVAL_MS..=MAX_ENFORCE_INTERVAL_MS).contains(&self.enforce_interval_ms)
+        {
+            bail!(
+                "enforce_interval_ms must be between {MIN_ENFORCE_INTERVAL_MS} and {MAX_ENFORCE_INTERVAL_MS}"
+            )
+        }
+        for (&profile, name) in &self.profile_names {
+            validate_human_profile(profile).context("invalid cached profile index")?;
+            validate_profile_name(name).context("invalid cached profile name")?;
+        }
+        Ok(())
+    }
+
     fn configured_profile(&self) -> Result<u8> {
         let profile = match std::env::consts::OS {
             "windows" => self.profiles.windows,
@@ -253,9 +291,22 @@ fn validate_human_profile(profile: u8) -> Result<()> {
     }
 }
 
+fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("profile name must not be empty")
+    }
+    if name.len() > MAX_PROFILE_NAME_BYTES {
+        bail!("profile name exceeds {MAX_PROFILE_NAME_BYTES} UTF-8 bytes")
+    }
+    if name.chars().any(char::is_control) {
+        bail!("profile name contains control characters")
+    }
+    Ok(())
+}
+
 fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = override_path {
-        return Ok(path.to_path_buf());
+        return std::path::absolute(path).context("could not resolve the configuration path");
     }
 
     let base =
@@ -263,33 +314,69 @@ fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
     Ok(base.join("WootingHostProfile").join("config.toml"))
 }
 
+fn default_config() -> Config {
+    Config {
+        enabled: default_true(),
+        show_status_icon: default_true(),
+        profiles: Profiles::default(),
+        profile_names: BTreeMap::new(),
+        refresh_lighting: default_true(),
+        command_delay_ms: default_command_delay_ms(),
+        enforce: false,
+        enforce_interval_ms: default_enforce_interval_ms(),
+    }
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     if !path.exists() {
-        return Ok(Config {
-            enabled: default_true(),
-            show_status_icon: default_true(),
-            profiles: Profiles::default(),
-            profile_names: BTreeMap::new(),
-            refresh_lighting: default_true(),
-            command_delay_ms: default_command_delay_ms(),
-            enforce: false,
-            enforce_interval_ms: default_enforce_interval_ms(),
-        });
+        return Ok(default_config());
     }
 
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read configuration from {}", path.display()))?;
-    toml::from_str(&text)
-        .with_context(|| format!("failed to parse configuration at {}", path.display()))
+    let config: Config = toml::from_str(&text)
+        .with_context(|| format!("failed to parse configuration at {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("invalid configuration at {}", path.display()))?;
+    Ok(config)
 }
 
-fn save_config(path: &Path, config: &Config) -> Result<()> {
+fn config_lock(path: &Path) -> Result<fs::File> {
     let parent = path.parent().context("configuration path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(parent.join("config.lock"))?;
+    FileExt::lock_exclusive(&lock).context("failed to lock the configuration")?;
+    Ok(lock)
+}
 
+fn write_config_atomic(path: &Path, config: &Config) -> Result<()> {
+    config.validate()?;
+    let parent = path.parent().context("configuration path has no parent")?;
     let text = toml::to_string_pretty(config).context("failed to serialize configuration")?;
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create a temporary file in {}", parent.display()))?;
+    temporary.write_all(text.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
     Ok(())
+}
+
+fn update_config(path: &Path, mutate: impl FnOnce(&mut Config) -> Result<()>) -> Result<Config> {
+    let _lock = config_lock(path)?;
+    let mut config = load_config(path)?;
+    mutate(&mut config)?;
+    write_config_atomic(path, &config)?;
+    Ok(config)
 }
 
 fn decode_chromium_string(bytes: &[u8]) -> Result<Cow<'_, str>> {
@@ -363,7 +450,12 @@ fn copy_leveldb(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_profiles_from_leveldb(source: &Path) -> Result<Vec<(u8, String)>> {
+struct WootilityProfileCache {
+    onboard: Vec<(u8, String)>,
+    linked_count: Option<usize>,
+}
+
+fn load_profile_cache_from_leveldb(source: &Path) -> Result<WootilityProfileCache> {
     const WEB_KEY: &[u8] = b"_https://wootility.io\x00\x01persist:root";
     const WEB_KEY_SUFFIX: &[u8] = b"persist:root";
     let temporary = tempfile::tempdir()?;
@@ -415,26 +507,48 @@ fn load_profiles_from_leveldb(source: &Path) -> Result<Vec<(u8, String)>> {
         .and_then(Value::as_str)
         .context("Wootility profile state was missing")?;
     let profiles: Value = serde_json::from_str(profiles_text)?;
-    let onboard = profiles
+    let device_profiles = profiles
         .get("devices")
         .and_then(|value| value.get(active_device))
-        .and_then(|value| value.get("onboard"))
+        .context("Wootility had no profiles for the active keyboard")?;
+    let onboard = device_profiles
+        .get("onboard")
         .and_then(Value::as_array)
         .context("Wootility had no onboard profiles for the active keyboard")?;
 
-    onboard
+    let onboard = onboard
         .iter()
+        .take(usize::from(PROFILE_COUNT))
         .enumerate()
-        .map(|(index, profile)| {
-            let human_index = u8::try_from(index + 1).context("too many onboard profiles")?;
+        .filter_map(|(index, profile)| {
+            let human_index = u8::try_from(index + 1).ok()?;
             let name = profile
                 .get("details")
                 .and_then(|value| value.get("name"))
-                .and_then(Value::as_str)
-                .context("an onboard profile had no name")?;
-            Ok((human_index, name.to_owned()))
+                .and_then(Value::as_str)?;
+            Some(validate_profile_name(name).map(|()| (human_index, name.to_owned())))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let linked_count = device_profiles
+        .get("linked")
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    Ok(WootilityProfileCache {
+        onboard,
+        linked_count,
+    })
+}
+
+fn load_profiles_from_leveldb(source: &Path) -> Result<Vec<(u8, String)>> {
+    Ok(load_profile_cache_from_leveldb(source)?.onboard)
+}
+
+fn discover_linked_profile_count() -> Option<usize> {
+    wootility_leveldb_paths().into_iter().find_map(|path| {
+        load_profile_cache_from_leveldb(&path)
+            .ok()
+            .and_then(|cache| cache.linked_count)
+    })
 }
 
 fn profile_info(
@@ -457,27 +571,36 @@ fn cache_profile_names(config: &mut Config, profiles: &[(u8, String)]) {
     config.profile_names = profiles.iter().cloned().collect();
 }
 
-fn discover_profiles(config: &mut Config) -> Vec<ProfileInfo> {
-    let keyboard = Keyboard::connect_first();
+fn discover_profiles_with_keyboard(
+    keyboard: Option<&Keyboard>,
+    config: &mut Config,
+) -> Vec<ProfileInfo> {
     let current = keyboard
-        .as_ref()
         .and_then(|connected| connected.current_profile().ok())
         .map(|index| index + 1);
     let assigned = config.configured_profile().ok().map(|index| index + 1);
 
-    if let Some(connected) = keyboard.as_ref() {
-        let profiles: Vec<_> = (0..PROFILE_COUNT)
-            .filter_map(|index| {
-                connected
-                    .profile_name(index)
-                    .ok()
-                    .flatten()
-                    .map(|name| (index + 1, name))
-            })
-            .collect();
-        if !profiles.is_empty() {
-            cache_profile_names(config, &profiles);
-            return profile_info(profiles, current, assigned);
+    if let Some(connected) = keyboard {
+        for attempt in 0..2 {
+            let profiles: Result<Vec<_>> = (0..PROFILE_COUNT)
+                .map(|index| {
+                    connected.profile_name(index).and_then(|name| {
+                        name.map(|name| {
+                            validate_profile_name(&name)?;
+                            Ok((index + 1, name))
+                        })
+                        .transpose()
+                    })
+                })
+                .filter_map(Result::transpose)
+                .collect();
+            if let Ok(profiles) = profiles {
+                cache_profile_names(config, &profiles);
+                return profile_info(profiles, current, assigned);
+            }
+            if attempt == 0 {
+                thread::sleep(Duration::from_millis(25));
+            }
         }
     }
 
@@ -508,16 +631,65 @@ fn discover_profiles(config: &mut Config) -> Vec<ProfileInfo> {
     )
 }
 
+fn discover_profiles(config: &mut Config) -> Vec<ProfileInfo> {
+    let keyboard = Keyboard::connect_first();
+    discover_profiles_with_keyboard(keyboard.as_ref(), config)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct KeyboardState {
     profile: u8,
-    wootdev_active: bool,
+    wootdev: WootDevOwnership,
 }
 
-struct Keyboard;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WootDevOwnership {
+    Active,
+    Inactive,
+    Unknown,
+}
+
+fn validate_response_command(buffer: &[u8], expected: u8, multi_report: bool) -> Result<()> {
+    let command_offset = 2 + usize::from(multi_report);
+    match buffer.get(command_offset) {
+        Some(&actual) if actual == expected => Ok(()),
+        Some(&actual) => bail!("command {expected} response echoed command {actual}"),
+        None => bail!("command {expected} response omitted its command envelope"),
+    }
+}
+
+fn parse_legacy_profile(buffer: &[u8], data_offset: usize) -> Result<u8> {
+    let profile = *buffer
+        .get(data_offset)
+        .ok_or_else(|| anyhow!("profile response did not contain byte {data_offset}"))?;
+    if profile >= PROFILE_COUNT {
+        bail!("keyboard returned unsupported onboard profile index {profile}")
+    }
+    Ok(profile)
+}
+
+const STATE_QUERY_FAILURES_BEFORE_DISCONNECT: u8 = 3;
+
+fn should_enforce(state: KeyboardState, enabled: bool, enforce: bool) -> bool {
+    state.wootdev == WootDevOwnership::Inactive && enabled && enforce
+}
+
+struct Keyboard {
+    _device_lock: fs::File,
+}
 
 impl Keyboard {
     fn connect_first() -> Option<Self> {
+        let lock_directory = dirs::cache_dir()?.join("WootingHostProfile");
+        fs::create_dir_all(&lock_directory).ok()?;
+        let device_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_directory.join("device.lock"))
+            .ok()?;
+        FileExt::try_lock_exclusive(&device_lock).ok()?;
         unsafe {
             rgb::wooting_usb_disconnect(false);
             if !rgb::wooting_usb_find_keyboard() {
@@ -532,7 +704,9 @@ impl Keyboard {
             // uses the configuration protocol, not live third-party RGB.
             let _ = rgb::wooting_usb_send_feature(WOOT_DEV_RESET_ALL, 0, 0, 0, 0);
         }
-        Some(Self)
+        Some(Self {
+            _device_lock: device_lock,
+        })
     }
 
     #[allow(clippy::unused_self)]
@@ -563,20 +737,19 @@ impl Keyboard {
         let buffer = self.command_response(GET_CURRENT_KEYBOARD_PROFILE_INDEX, 0)?;
         unsafe {
             let uses_multi_report = rgb::wooting_usb_use_multi_report();
+            validate_response_command(
+                &buffer,
+                GET_CURRENT_KEYBOARD_PROFILE_INDEX,
+                uses_multi_report,
+            )?;
             let report_offset = usize::from(uses_multi_report);
             let extra_data_offset = usize::from(uses_multi_report);
             let is_v2 = rgb::wooting_usb_use_v2_interface();
             let data_offset = report_offset + if is_v2 { 5 } else { 4 } + extra_data_offset;
-            let profile = *buffer
-                .get(data_offset)
-                .ok_or_else(|| anyhow!("profile response did not contain byte {data_offset}"))?;
-
-            if profile >= PROFILE_COUNT {
-                bail!("keyboard returned unsupported onboard profile index {profile}")
-            }
+            let profile = parse_legacy_profile(&buffer, data_offset)?;
             Ok(KeyboardState {
                 profile,
-                wootdev_active: false,
+                wootdev: WootDevOwnership::Unknown,
             })
         }
     }
@@ -584,13 +757,12 @@ impl Keyboard {
     fn heartbeat_state(&self) -> Result<KeyboardState> {
         let buffer = self.command_response(HEARTBEAT, 0)?;
         unsafe {
-            let command_offset = 2 + usize::from(rgb::wooting_usb_use_multi_report());
-            if buffer.get(command_offset) != Some(&HEARTBEAT) {
-                bail!("heartbeat response echoed the wrong command")
-            }
+            let multi_report = rgb::wooting_usb_use_multi_report();
+            validate_response_command(&buffer, HEARTBEAT, multi_report)?;
+            let command_offset = 2 + usize::from(multi_report);
             let mut cursor = command_offset + 2;
             let mut profile = None;
-            let mut wootdev_active = false;
+            let mut wootdev = None;
             while let Some(&tag) = buffer.get(cursor) {
                 if tag == 0 {
                     break;
@@ -617,7 +789,13 @@ impl Keyboard {
                 }
                 match tag >> 3 {
                     1 => profile = Some(u8::try_from(value)?),
-                    2 => wootdev_active = value != 0,
+                    2 => {
+                        wootdev = Some(if value != 0 {
+                            WootDevOwnership::Active
+                        } else {
+                            WootDevOwnership::Inactive
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -627,7 +805,7 @@ impl Keyboard {
             }
             Ok(KeyboardState {
                 profile,
-                wootdev_active,
+                wootdev: wootdev.unwrap_or(WootDevOwnership::Unknown),
             })
         }
     }
@@ -635,7 +813,7 @@ impl Keyboard {
     fn current_state(&self) -> Result<KeyboardState> {
         let supports_heartbeat = unsafe { rgb::wooting_usb_use_multi_report() };
         if supports_heartbeat {
-            self.heartbeat_state().or_else(|_| self.legacy_state())
+            self.heartbeat_state()
         } else {
             self.legacy_state()
         }
@@ -670,6 +848,7 @@ impl Keyboard {
             if response != expected_response {
                 bail!("profile metadata read failed")
             }
+            validate_response_command(&buffer, GET_PROFILE_METADATA, uses_multi_report)?;
 
             let is_v2 = rgb::wooting_usb_use_v2_interface();
             let data_offset = report_offset + if is_v2 { 5 } else { 4 } + extra_data_offset;
@@ -705,29 +884,47 @@ impl Keyboard {
         }
 
         self.send_feature(WOOT_DEV_INIT, 0, "initialization")?;
-        self.send_feature(ACTIVATE_PROFILE, profile, "profile activation")?;
-        thread::sleep(Duration::from_millis(100));
+        let mut session = WootDevSession::new(self);
+        let operation = (|| {
+            self.send_feature(ACTIVATE_PROFILE, profile, "profile activation")?;
+            thread::sleep(Duration::from_millis(100));
+
+            let modern = unsafe {
+                rgb::wooting_usb_use_v2_interface() || rgb::wooting_usb_use_multi_report()
+            };
+            let reload = if modern {
+                RELOAD_PROFILE
+            } else {
+                RELOAD_PROFILE_LEGACY
+            };
+            if let Err(error) = self.send_feature(reload, profile, "profile reload") {
+                if !modern {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(config.command_delay_ms.max(250)));
+                self.send_feature(RELOAD_PROFILE_LEGACY, profile, "legacy profile reload")?;
+            }
+
+            if !self.wait_for_profile(profile, Duration::from_millis(500)) {
+                bail!("keyboard did not report P{} after activation", profile + 1)
+            }
+            Ok(())
+        })();
+
+        match operation {
+            Ok(()) => session.reset()?,
+            Err(error) => {
+                if let Err(cleanup_error) = session.reset() {
+                    return Err(
+                        error.context(format!("WootDev cleanup also failed: {cleanup_error:#}"))
+                    );
+                }
+                return Err(error);
+            }
+        }
 
         let modern =
             unsafe { rgb::wooting_usb_use_v2_interface() || rgb::wooting_usb_use_multi_report() };
-        let reload = if modern {
-            RELOAD_PROFILE
-        } else {
-            RELOAD_PROFILE_LEGACY
-        };
-        if let Err(error) = self.send_feature(reload, profile, "profile reload") {
-            if !modern {
-                return Err(error);
-            }
-            thread::sleep(Duration::from_millis(config.command_delay_ms.max(250)));
-            self.send_feature(RELOAD_PROFILE_LEGACY, profile, "legacy profile reload")?;
-        }
-
-        if !self.wait_for_profile(profile, Duration::from_millis(500)) {
-            bail!("keyboard did not report P{} after activation", profile + 1)
-        }
-
-        self.send_feature(WOOT_DEV_RESET_ALL, 0, "RGB ownership reset")?;
         if config.refresh_lighting && !modern {
             thread::sleep(Duration::from_millis(config.command_delay_ms));
             self.send_feature(REFRESH_RGB_COLORS, profile, "legacy RGB refresh")?;
@@ -759,6 +956,39 @@ impl Keyboard {
                 return false;
             }
             thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+struct WootDevSession<'a> {
+    keyboard: &'a Keyboard,
+    reset: bool,
+}
+
+impl<'a> WootDevSession<'a> {
+    fn new(keyboard: &'a Keyboard) -> Self {
+        Self {
+            keyboard,
+            reset: false,
+        }
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.keyboard
+            .send_feature(WOOT_DEV_RESET_ALL, 0, "RGB ownership reset")?;
+        self.reset = true;
+        Ok(())
+    }
+}
+
+impl Drop for WootDevSession<'_> {
+    fn drop(&mut self) {
+        if !self.reset {
+            let _ = self.keyboard.send_feature(
+                WOOT_DEV_RESET_ALL,
+                0,
+                "best-effort RGB ownership reset",
+            );
         }
     }
 }
@@ -811,14 +1041,86 @@ fn append_log(config_path: &Path, message: &str) {
     };
     let _ = fs::create_dir_all(parent);
     let log_path = parent.join("watch.log");
+    if fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() >= MAX_LOG_BYTES) {
+        let previous = parent.join("watch.log.1");
+        let _ = fs::remove_file(&previous);
+        let _ = fs::rename(&log_path, previous);
+    }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let _ = writeln!(file, "{message}");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let _ = writeln!(file, "{timestamp} {message}");
     }
 }
 
-fn try_ipc_set(human_profile: u8) -> Result<bool> {
+fn ipc_address(config_path: &Path) -> SocketAddrV4 {
+    let mut hasher = DefaultHasher::new();
+    let normalized = if cfg!(windows) {
+        config_path.to_string_lossy().to_lowercase()
+    } else {
+        config_path.to_string_lossy().into_owned()
+    };
+    normalized.hash(&mut hasher);
+    let offset = u16::try_from(hasher.finish() % u64::from(IPC_PORT_COUNT))
+        .expect("IPC port offset is bounded");
+    SocketAddrV4::new(Ipv4Addr::LOCALHOST, IPC_PORT_BASE + offset)
+}
+
+fn ipc_token_path(config_path: &Path) -> Result<PathBuf> {
+    let parent = config_path
+        .parent()
+        .context("configuration path has no parent directory")?;
+    Ok(parent.join(format!("ipc-{}.token", ipc_address(config_path).port())))
+}
+
+fn read_ipc_token(config_path: &Path) -> Result<String> {
+    let path = ipc_token_path(config_path)?;
+    let token = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read IPC token from {}", path.display()))?;
+    let token = token.trim();
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("IPC token file was invalid")
+    }
+    Ok(token.to_owned())
+}
+
+fn create_ipc_token(config_path: &Path) -> Result<String> {
+    let path = ipc_token_path(config_path)?;
+    let parent = path.parent().context("IPC token path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow!("could not generate IPC token: {error}"))?;
+    let mut token = String::with_capacity(64);
+    for byte in bytes {
+        token.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        token.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(token.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace IPC token at {}", path.display()))?;
+    Ok(token)
+}
+
+fn try_ipc_set(config_path: &Path, human_profile: u8) -> Result<bool> {
     validate_human_profile(human_profile)?;
-    let address = IPC_ADDRESS.parse()?;
+    let Ok(token) = read_ipc_token(config_path) else {
+        return Ok(false);
+    };
+    let address = SocketAddr::V4(ipc_address(config_path));
     let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(25)) {
         Ok(stream) => stream,
         Err(error)
@@ -837,7 +1139,7 @@ fn try_ipc_set(human_profile: u8) -> Result<bool> {
     // and refresh commands. Leave enough time for that complete transaction.
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "SET {human_profile}")?;
+    writeln!(stream, "SET {human_profile} {token}")?;
     stream.shutdown(Shutdown::Write)?;
     let mut buffer = [0_u8; 256];
     let count = stream.read(&mut buffer)?;
@@ -852,50 +1154,150 @@ fn try_ipc_set(human_profile: u8) -> Result<bool> {
     }
 }
 
-fn handle_ipc_stream(mut stream: TcpStream, keyboard: &mut Option<Keyboard>, config_path: &Path) {
-    let prepared = (|| -> Result<(u8, Config)> {
-        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpcRequest {
+    Set(u8),
+    Profiles,
+}
+
+fn try_ipc_profiles(config_path: &Path) -> Result<Option<Vec<ProfileInfo>>> {
+    let Ok(token) = read_ipc_token(config_path) else {
+        return Ok(None);
+    };
+    let address = SocketAddr::V4(ipc_address(config_path));
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(25)) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "PROFILES {token}")?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = Vec::new();
+    (&mut stream).take(8_193).read_to_end(&mut response)?;
+    if response.len() > 8_192 {
+        bail!("background watcher returned an oversized profile list")
+    }
+    let response = std::str::from_utf8(&response)?.trim();
+    if let Some(error) = response.strip_prefix("ERR ") {
+        bail!("background watcher rejected profile discovery: {error}")
+    }
+    Ok(Some(serde_json::from_str(response)?))
+}
+
+fn parse_ipc_request(request: &[u8], expected_token: &str) -> Result<IpcRequest> {
+    if request.len() > usize::try_from(IPC_REQUEST_LIMIT)? {
+        bail!("IPC request was too large")
+    }
+    if !request.ends_with(b"\n") {
+        bail!("IPC request was incomplete")
+    }
+    let request = std::str::from_utf8(request)?;
+    let mut fields = request.trim_end_matches(['\r', '\n']).split(' ');
+    match fields.next() {
+        Some("SET") => {
+            let profile = fields
+                .next()
+                .context("IPC profile was missing")?
+                .parse::<u8>()?;
+            let token = fields.next().context("IPC token was missing")?;
+            if fields.next().is_some() || token != expected_token {
+                bail!("IPC authentication failed")
+            }
+            validate_human_profile(profile)?;
+            Ok(IpcRequest::Set(profile))
+        }
+        Some("PROFILES") => {
+            let token = fields.next().context("IPC token was missing")?;
+            if fields.next().is_some() || token != expected_token {
+                bail!("IPC authentication failed")
+            }
+            Ok(IpcRequest::Profiles)
+        }
+        _ => bail!("unknown IPC command"),
+    }
+}
+
+fn handle_ipc_stream(
+    mut stream: TcpStream,
+    keyboard: &mut Option<Keyboard>,
+    config_path: &Path,
+    expected_token: &str,
+) {
+    let response = (|| -> Result<String> {
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         stream.set_write_timeout(Some(Duration::from_millis(250)))?;
-        let mut request = String::new();
-        stream.read_to_string(&mut request)?;
-        let profile = request
-            .trim()
-            .strip_prefix("SET ")
-            .context("unknown IPC command")?
-            .parse::<u8>()?;
-        validate_human_profile(profile)?;
+        let mut request = Vec::new();
+        (&mut stream)
+            .take(IPC_REQUEST_LIMIT + 1)
+            .read_to_end(&mut request)?;
+        let request = parse_ipc_request(&request, expected_token)?;
         if keyboard.is_none() {
             *keyboard = Keyboard::connect_first();
         }
-        keyboard
+        let connected = keyboard
             .as_ref()
             .context("no Wooting keyboard is connected")?;
-        let mut config = load_config(config_path)?;
-        config.learn_for_current_os(profile)?;
-        Ok((profile, config))
+        match request {
+            IpcRequest::Set(profile) => {
+                let mut config = load_config(config_path)?;
+                config.learn_for_current_os(profile)?;
+                apply_and_verify(connected, &config, false)?;
+                Ok("OK".to_owned())
+            }
+            IpcRequest::Profiles => {
+                let mut config = load_config(config_path)?;
+                let mut profiles = discover_profiles_with_keyboard(Some(connected), &mut config);
+                let discovered_names = config.profile_names.clone();
+                config = update_config(config_path, move |latest| {
+                    latest.profile_names = discovered_names;
+                    Ok(())
+                })?;
+                let assigned = config.configured_profile().ok().map(|index| index + 1);
+                for profile in &mut profiles {
+                    profile.assigned = assigned == Some(profile.index);
+                }
+                Ok(serde_json::to_string(&profiles)?)
+            }
+        }
     })();
 
-    match prepared {
-        Err(error) => {
-            let _ = writeln!(stream, "ERR {error:#}");
+    match response {
+        Ok(response) => {
+            let _ = writeln!(stream, "{response}");
+            let _ = stream.flush();
         }
-        Ok((profile, config)) => {
-            let Some(connected) = keyboard.as_ref() else {
-                return;
-            };
-            match connected.activate_profile(profile - 1, &config) {
-                Ok(()) => {
-                    let _ = stream.write_all(b"OK\n");
-                    let _ = stream.flush();
-                }
-                Err(error) => {
-                    append_log(
-                        config_path,
-                        &format!("IPC profile application failed: {error:#}"),
-                    );
-                    let _ = writeln!(stream, "ERR {error:#}");
-                    let _ = stream.flush();
-                }
+        Err(error) => {
+            append_log(config_path, &format!("IPC request failed: {error:#}"));
+            let _ = writeln!(stream, "ERR {error:#}");
+            let _ = stream.flush();
+        }
+    }
+}
+
+fn service_ipc_clients(
+    listener: &TcpListener,
+    keyboard: &mut Option<Keyboard>,
+    config_path: &Path,
+    ipc_token: &str,
+) {
+    for _ in 0..8 {
+        match listener.accept() {
+            Ok((stream, _)) => handle_ipc_stream(stream, keyboard, config_path, ipc_token),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                append_log(config_path, &format!("IPC accept failed: {error}"));
+                break;
             }
         }
     }
@@ -916,8 +1318,10 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
     if FileExt::try_lock_exclusive(&lock).is_err() {
         return Ok(());
     }
-    let listener = TcpListener::bind(IPC_ADDRESS)
-        .with_context(|| format!("failed to bind local control socket {IPC_ADDRESS}"))?;
+    let ipc_token = create_ipc_token(config_path)?;
+    let ipc_address = ipc_address(config_path);
+    let listener = TcpListener::bind(ipc_address)
+        .with_context(|| format!("failed to bind local control socket {ipc_address}"))?;
     listener.set_nonblocking(true)?;
 
     let running = Arc::new(AtomicBool::new(true));
@@ -931,26 +1335,19 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
     );
 
     let mut keyboard: Option<Keyboard> = None;
+    let mut consecutive_state_errors = 0_u8;
     let mut next_device_check = Instant::now();
     let mut next_enforcement_check = Instant::now();
 
     while running.load(Ordering::SeqCst) {
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => handle_ipc_stream(stream, &mut keyboard, config_path),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    append_log(config_path, &format!("IPC accept failed: {error}"));
-                    break;
-                }
-            }
-        }
+        service_ipc_clients(&listener, &mut keyboard, config_path, &ipc_token);
 
         if Instant::now() >= next_device_check {
             let mut next_check_delay = interval;
             if keyboard.is_none() {
                 keyboard = Keyboard::connect_first();
                 if let Some(connected) = keyboard.as_ref() {
+                    consecutive_state_errors = 0;
                     let config = load_config(config_path)?;
                     if !config.enabled {
                         append_log(
@@ -970,11 +1367,11 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
                 }
             } else if let Some(connected) = keyboard.as_ref() {
                 if let Ok(state) = connected.current_state() {
+                    consecutive_state_errors = 0;
                     let config = load_config(config_path)?;
-                    let enforcement_due = !state.wootdev_active
-                        && config.enabled
-                        && (enforce_override || config.enforce)
-                        && Instant::now() >= next_enforcement_check;
+                    let enforcement_due =
+                        should_enforce(state, config.enabled, enforce_override || config.enforce)
+                            && Instant::now() >= next_enforcement_check;
                     if enforcement_due {
                         if let Err(error) = apply_and_verify(connected, &config, false) {
                             append_log(
@@ -985,15 +1382,25 @@ fn watch(config_path: &Path, interval: Duration, enforce_override: bool) -> Resu
                         next_enforcement_check =
                             Instant::now() + Duration::from_millis(config.enforce_interval_ms);
                     }
-                    if state.wootdev_active {
+                    if state.wootdev == WootDevOwnership::Active {
                         next_enforcement_check =
                             Instant::now() + Duration::from_millis(config.enforce_interval_ms);
                         next_check_delay =
                             interval.max(Duration::from_millis(config.enforce_interval_ms));
                     }
                 } else {
-                    append_log(config_path, "Keyboard disconnected");
-                    keyboard = None;
+                    consecutive_state_errors = consecutive_state_errors.saturating_add(1);
+                    if consecutive_state_errors == 1 {
+                        append_log(config_path, "Keyboard state query failed; retrying");
+                    }
+                    if consecutive_state_errors >= STATE_QUERY_FAILURES_BEFORE_DISCONNECT {
+                        append_log(
+                            config_path,
+                            "Keyboard disconnected after repeated state query failures",
+                        );
+                        keyboard = None;
+                        consecutive_state_errors = 0;
+                    }
                 }
             }
             next_device_check = Instant::now() + next_check_delay;
@@ -1197,7 +1604,11 @@ mod legacy_custom_drawn_gui {
 
         fn save_and_run(&mut self) -> Result<()> {
             self.config.learn_for_current_os(self.selected_profile)?;
-            save_config(&self.config_path, &self.config)?;
+            let desired = self.config.clone();
+            self.config = update_config(&self.config_path, move |latest| {
+                *latest = desired;
+                Ok(())
+            })?;
             set_startup_enabled(self.start_at_login, &self.config_path)?;
             if Keyboard::connect_first().is_some() {
                 self.apply_selected()?;
@@ -1336,8 +1747,16 @@ fn run_native_config(config_path: &Path, mut config: Config) -> Result<()> {
         core::PCWSTR,
     };
 
-    let profiles = discover_profiles(&mut config);
-    save_config(config_path, &config)?;
+    let mut profiles = discover_profiles(&mut config);
+    let discovered_names = config.profile_names.clone();
+    config = update_config(config_path, move |latest| {
+        latest.profile_names = discovered_names;
+        Ok(())
+    })?;
+    let assigned = config.configured_profile().ok().map(|index| index + 1);
+    for profile in &mut profiles {
+        profile.assigned = assigned == Some(profile.index);
+    }
     let title = wide("Wooting Switch");
     let instruction = wide("Choose the profile for this Windows system");
     let content = wide(
@@ -1430,8 +1849,9 @@ fn run_native_config(config_path: &Path, mut config: Config) -> Result<()> {
         bail!("the selected profile is not configured on this keyboard")
     }
 
-    config.learn_for_current_os(selected_profile)?;
-    save_config(config_path, &config)?;
+    config = update_config(config_path, |latest| {
+        latest.learn_for_current_os(selected_profile)
+    })?;
     set_startup_enabled(verification_checked.as_bool(), config_path)?;
     if let Some(keyboard) = Keyboard::connect_first() {
         apply_and_verify(&keyboard, &config, false)?;
@@ -1451,11 +1871,13 @@ fn run_native_config(_config_path: &Path, _config: Config) -> Result<()> {
 }
 
 fn set_automatic_switching(path: &Path, config: &mut Config, enabled: bool) -> Result<()> {
-    config.enabled = enabled;
-    save_config(path, config)?;
+    *config = update_config(path, |latest| {
+        latest.enabled = enabled;
+        Ok(())
+    })?;
     if enabled {
         if let Ok(profile) = config.configured_profile()
-            && !try_ipc_set(profile + 1)?
+            && !try_ipc_set(path, profile + 1)?
             && let Some(keyboard) = Keyboard::connect_first()
         {
             apply_and_verify(&keyboard, config, false)?;
@@ -1466,18 +1888,37 @@ fn set_automatic_switching(path: &Path, config: &mut Config, enabled: bool) -> R
 }
 
 fn set_enforcement(path: &Path, config: &mut Config, enabled: bool) -> Result<()> {
-    config.enforce = enabled;
-    save_config(path, config)
+    *config = update_config(path, |latest| {
+        latest.enforce = enabled;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn set_status_icon(path: &Path, config: &mut Config, visible: bool) -> Result<()> {
-    config.show_status_icon = visible;
-    save_config(path, config)
+    *config = update_config(path, |latest| {
+        latest.show_status_icon = visible;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn list_profiles(path: &Path, config: &mut Config, json: bool) -> Result<()> {
-    let profiles = discover_profiles(config);
-    save_config(path, config)?;
+    let profiles = if let Some(profiles) = try_ipc_profiles(path)? {
+        profiles
+    } else {
+        let mut profiles = discover_profiles(config);
+        let discovered_names = config.profile_names.clone();
+        *config = update_config(path, move |latest| {
+            latest.profile_names = discovered_names;
+            Ok(())
+        })?;
+        let assigned = config.configured_profile().ok().map(|index| index + 1);
+        for profile in &mut profiles {
+            profile.assigned = assigned == Some(profile.index);
+        }
+        profiles
+    };
     if json {
         println!("{}", serde_json::to_string(&profiles)?);
     } else {
@@ -1489,6 +1930,11 @@ fn list_profiles(path: &Path, config: &mut Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_linked_status() {
+    discover_linked_profile_count()
+        .map_or_else(|| println!("unknown"), |count| println!("{count}"));
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(cli.config.as_deref())?;
@@ -1497,6 +1943,9 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Profiles { json }) => {
             list_profiles(&path, &mut config, json)?;
+        }
+        Some(Command::LinkedStatus) => {
+            print_linked_status();
         }
         Some(Command::StartupStatus) => {
             println!("{}", startup_enabled());
@@ -1534,8 +1983,8 @@ fn main() -> Result<()> {
                 let keyboard = connect_required()?;
                 keyboard.current_profile()? + 1
             };
-            config.learn_for_current_os(human_profile)?;
-            save_config(&path, &config)?;
+            let _updated =
+                update_config(&path, |latest| latest.learn_for_current_os(human_profile))?;
             println!(
                 "Learned P{human_profile} for {} and saved {}",
                 std::env::consts::OS,
@@ -1544,7 +1993,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Apply) => {
             let profile = config.configured_profile()? + 1;
-            if !try_ipc_set(profile)? {
+            if !try_ipc_set(&path, profile)? {
                 let keyboard = connect_required()?;
                 apply_and_verify(&keyboard, &config, true)?;
             }
@@ -1562,15 +2011,14 @@ fn main() -> Result<()> {
         }
         Some(Command::Configure { profile, startup }) => {
             validate_human_profile(profile)?;
-            config.learn_for_current_os(profile)?;
-            save_config(&path, &config)?;
+            config = update_config(&path, |latest| latest.learn_for_current_os(profile))?;
             match startup {
                 StartupChoice::Keep => {}
                 StartupChoice::Enable => set_startup_enabled(true, &path)?,
                 StartupChoice::Disable => set_startup_enabled(false, &path)?,
             }
             if config.enabled
-                && !try_ipc_set(profile)?
+                && !try_ipc_set(&path, profile)?
                 && let Some(keyboard) = Keyboard::connect_first()
             {
                 apply_and_verify(&keyboard, &config, false)?;
@@ -1579,7 +2027,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Set { profile }) => {
             validate_human_profile(profile)?;
-            if !try_ipc_set(profile)? {
+            if !try_ipc_set(&path, profile)? {
                 let mut candidate = config.clone();
                 candidate.learn_for_current_os(profile)?;
                 let keyboard = connect_required()?;
@@ -1610,6 +2058,38 @@ mod tests {
     }
 
     #[test]
+    fn validates_response_command_envelopes() {
+        assert!(validate_response_command(&[0, 0, HEARTBEAT], HEARTBEAT, false).is_ok());
+        assert!(validate_response_command(&[0, 0, 0, HEARTBEAT], HEARTBEAT, true).is_ok());
+        assert!(
+            validate_response_command(&[0, 0, GET_PROFILE_METADATA], HEARTBEAT, false).is_err()
+        );
+        assert!(validate_response_command(&[0, 0], HEARTBEAT, false).is_err());
+    }
+
+    #[test]
+    fn parses_only_valid_legacy_profile_indexes() {
+        assert_eq!(parse_legacy_profile(&[0, 1], 1).unwrap(), 1);
+        assert!(parse_legacy_profile(&[0, 8], 1).is_err());
+        assert!(parse_legacy_profile(&[0], 1).is_err());
+    }
+
+    #[test]
+    fn only_known_inactive_wootdev_state_allows_enforcement() {
+        let mut state = KeyboardState {
+            profile: 0,
+            wootdev: WootDevOwnership::Inactive,
+        };
+        assert!(should_enforce(state, true, true));
+        state.wootdev = WootDevOwnership::Active;
+        assert!(!should_enforce(state, true, true));
+        state.wootdev = WootDevOwnership::Unknown;
+        assert!(!should_enforce(state, true, true));
+        assert!(!should_enforce(state, false, true));
+        assert!(!should_enforce(state, true, false));
+    }
+
+    #[test]
     fn config_round_trips() {
         let config = Config {
             enabled: true,
@@ -1631,5 +2111,69 @@ mod tests {
         let decoded: Config = toml::from_str(&text).expect("parse config");
         assert_eq!(decoded.profiles.windows, Some(2));
         assert_eq!(decoded.profiles.macos, Some(1));
+    }
+
+    #[test]
+    fn rejects_unsafe_configuration_values() {
+        let mut config = default_config();
+        config.command_delay_ms = 0;
+        assert!(config.validate().is_err());
+
+        config = default_config();
+        config.enforce_interval_ms = 100;
+        assert!(config.validate().is_err());
+
+        config = default_config();
+        config.profile_names.insert(5, "Out of range".to_owned());
+        assert!(config.validate().is_err());
+
+        config = default_config();
+        config.profile_names.insert(1, "Bad\nName".to_owned());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_only_authenticated_bounded_ipc_requests() {
+        assert_eq!(
+            parse_ipc_request(b"SET 2 secret\n", "secret").unwrap(),
+            IpcRequest::Set(2)
+        );
+        assert_eq!(
+            parse_ipc_request(b"PROFILES secret\n", "secret").unwrap(),
+            IpcRequest::Profiles
+        );
+        assert!(parse_ipc_request(b"SET 2 wrong\n", "secret").is_err());
+        assert!(parse_ipc_request(b"SET 2 secret", "secret").is_err());
+        assert!(parse_ipc_request(b"SET 5 secret\n", "secret").is_err());
+        assert!(parse_ipc_request(&[b'x'; 129], "secret").is_err());
+    }
+
+    #[test]
+    fn scoped_config_updates_preserve_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let first = update_config(&path, |config| {
+            config.enabled = false;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!first.enabled);
+
+        let second = update_config(&path, |config| {
+            config.enforce = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!second.enabled);
+        assert!(second.enforce);
+        assert!(!load_config(&path).unwrap().enabled);
+    }
+
+    #[test]
+    fn ipc_endpoint_is_stable_and_config_scoped() {
+        let first = Path::new("C:/one/config.toml");
+        let second = Path::new("C:/two/config.toml");
+        assert_eq!(ipc_address(first), ipc_address(first));
+        assert_ne!(ipc_address(first), ipc_address(second));
     }
 }

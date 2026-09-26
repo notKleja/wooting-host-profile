@@ -60,15 +60,34 @@ public sealed partial class MainPage : Page
     {
         LoadingRing.IsActive = busy;
         ProfilePicker.IsEnabled = !busy;
-        RememberButton.IsEnabled = !busy && SelectedProfile is not null;
+        RememberButton.IsEnabled = false;
         AppEnabledCheckBox.IsEnabled = !busy;
         EnforceCheckBox.IsEnabled = !busy;
         StartupCheckBox.IsEnabled = !busy;
         HideTrayCheckBox.IsEnabled = !busy;
         if (!busy)
         {
+            UpdateRememberButton();
             DispatcherQueue.TryEnqueue(() => LayoutReady?.Invoke(this, EventArgs.Empty));
         }
+    }
+
+    private void UpdateRememberButton()
+    {
+        if (SelectedProfile is not ProfileInfo profile)
+        {
+            RememberButton.Content = "Remember & activate";
+            RememberButton.IsEnabled = false;
+            return;
+        }
+
+        RememberButton.Content = (profile.Active, profile.Assigned) switch
+        {
+            (true, true) => "Up to date",
+            (false, true) => "Activate",
+            _ => "Remember & activate",
+        };
+        RememberButton.IsEnabled = !_loading && !(profile.Active && profile.Assigned);
     }
 
     private void ShowStatus(string message)
@@ -86,6 +105,7 @@ public sealed partial class MainPage : Page
     private async Task RefreshProfilesAsync()
     {
         IReadOnlyList<ProfileInfo> profiles = await AgentService.GetProfilesAsync();
+        int? linkedProfiles = await AgentService.GetLinkedProfileCountAsync();
         Profiles.Clear();
         foreach (ProfileInfo profile in profiles)
         {
@@ -94,19 +114,31 @@ public sealed partial class MainPage : Page
         ProfilePicker.SelectedItem = Profiles.FirstOrDefault(profile => profile.Assigned)
             ?? Profiles.FirstOrDefault(profile => profile.Active)
             ?? Profiles.FirstOrDefault();
+        ProfileSummaryText.Text = $"{Profiles.Count} / 4 onboard profiles";
+        AppLinkingText.Text = linkedProfiles switch
+        {
+            > 0 => $"Conflict detected: {linkedProfiles} Wootility linked profile(s) can override this app.",
+            0 => "Wootility App Linking: no linked profiles detected.",
+            _ => "Wootility App Linking status is unavailable.",
+        };
         if (Profiles.Count == 0)
         {
             ShowStatus("No configured onboard profiles found.");
+        }
+        else if (!Profiles.Any(profile => profile.Active))
+        {
+            ShowStatus("Keyboard status unavailable. Showing saved profile information.");
         }
         else
         {
             HideStatus();
         }
+        UpdateRememberButton();
     }
 
     private void ProfilePicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        RememberButton.IsEnabled = !_loading && SelectedProfile is not null;
+        UpdateRememberButton();
         HideStatus();
     }
 
@@ -119,11 +151,15 @@ public sealed partial class MainPage : Page
 
         HideStatus();
         SetBusy(true);
+        bool wasAssigned = profile.Assigned;
         try
         {
             await AgentService.ConfigureAsync(profile.Index, StartupCheckBox.IsChecked == true);
             _loading = true;
             await RefreshProfilesAsync();
+            ShowStatus(wasAssigned
+                ? $"P{profile.Index} activated and verified."
+                : $"P{profile.Index} saved for Windows and verified.");
         }
         catch (Exception error)
         {

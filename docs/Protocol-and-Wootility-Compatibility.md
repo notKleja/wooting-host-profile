@@ -39,6 +39,12 @@ Devices without heartbeat support fall back to command `11`
 (`GetCurrentKeyboardProfileIndex`). On ARM firmware its runtime profile is at
 payload offset 2; payload offset 0 is the flash-stored default.
 
+Legacy state does not reveal WootDev ownership. Wooting Switch therefore treats
+ownership as unknown and does not perform periodic enforcement on that state;
+startup, reconnect, and explicit profile selections still work. A multi-report
+heartbeat parse or command-correlation failure is not silently converted into a
+legacy state, because doing so could incorrectly claim that Wootility is idle.
+
 ## Profile names
 
 Profile names and populated slots are read with command `55`
@@ -66,6 +72,7 @@ The watcher now:
 - polls modern state with command `73` once per second;
 - keeps command `11` only as a legacy fallback;
 - detects WootDev ownership from heartbeat field 2;
+- treats missing or malformed ownership as unknown and suppresses enforcement;
 - suspends enforcement and backs off to the configured safe cooldown while
   Wootility owns WootDev;
 - releases its own WootDev state with command `32` after switching.
@@ -101,4 +108,3 @@ P2 -> P1: command path succeeded; heartbeat readback P1
 
 The saved Windows profile and all configuration values were restored after the
 test.
-

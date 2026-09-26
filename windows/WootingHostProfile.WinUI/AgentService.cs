@@ -37,6 +37,8 @@ public sealed class ProfileInfo
 
 public static class AgentService
 {
+    private static readonly TimeSpan DefaultOperationTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ProfileOperationTimeout = TimeSpan.FromSeconds(45);
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string RunValue = "Wooting Switch";
     private const string LegacyRunValue = "Wooting Host Profile";
@@ -68,16 +70,105 @@ public static class AgentService
     {
         using var process = Process.Start(CreateStartInfo(arguments, capture: true))
             ?? throw new InvalidOperationException("Could not start the Wooting background agent.");
-        string output = await process.StandardOutput.ReadToEndAsync();
-        string error = await process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
+
+        // Drain both redirected streams immediately so neither pipe can fill and
+        // block the child while we are waiting for the other stream to close.
+        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> errorTask = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(GetTimeout(arguments));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // The process exited between the check and Kill.
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                // Continue waiting below; the process may already be exiting.
+            }
+
+            await WaitForExitAfterKillAsync(process);
+            process.StandardOutput.Close();
+            process.StandardError.Close();
+            await DrainAfterExitAsync(outputTask, errorTask);
+            throw new InvalidOperationException(
+                "The Wooting background agent timed out. Check the keyboard connection and try again.");
+        }
+
+        string output = await outputTask;
+        string error = await errorTask;
         if (process.ExitCode != 0)
         {
-            throw new InvalidOperationException(string.IsNullOrWhiteSpace(error)
-                ? "The Wooting background agent failed."
-                : error.Trim());
+            throw new InvalidOperationException(FormatAgentError(error));
         }
         return output.Trim();
+    }
+
+    private static TimeSpan GetTimeout(IReadOnlyList<string> arguments) =>
+        arguments.Count > 0 && (arguments[0] is "profiles" or "configure")
+            ? ProfileOperationTimeout
+            : DefaultOperationTimeout;
+
+    private static string FormatAgentError(string error)
+    {
+        string firstLine = error.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .FirstOrDefault(line => line.Length > 0) ?? string.Empty;
+        if (firstLine.Length > 240)
+        {
+            firstLine = firstLine[..240] + "…";
+        }
+        return string.IsNullOrEmpty(firstLine)
+            ? "The Wooting background agent failed."
+            : firstLine;
+    }
+
+    private static async Task WaitForExitAfterKillAsync(Process process)
+    {
+        using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await process.WaitForExitAsync(cleanupTimeout.Token);
+        }
+        catch (InvalidOperationException)
+        {
+            // The process handle was closed while shutdown was being observed.
+        }
+        catch (OperationCanceledException) when (cleanupTimeout.IsCancellationRequested)
+        {
+            // Cleanup is best effort; never replace one hung agent with a hung UI.
+        }
+    }
+
+    private static async Task DrainAfterExitAsync(Task<string> outputTask, Task<string> errorTask)
+    {
+        try
+        {
+            Task drain = Task.WhenAll(outputTask, errorTask);
+            if (await Task.WhenAny(drain, Task.Delay(TimeSpan.FromSeconds(2))) == drain)
+            {
+                await drain;
+            }
+        }
+        catch (IOException)
+        {
+            // Stream closure during timeout cleanup is expected.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Stream closure during timeout cleanup is expected.
+        }
     }
 
     public static async Task<IReadOnlyList<ProfileInfo>> GetProfilesAsync()
@@ -85,6 +176,12 @@ public static class AgentService
         string json = await RunAsync("profiles", "--json");
         return JsonSerializer.Deserialize<List<ProfileInfo>>(json)
             ?? throw new InvalidOperationException("The agent returned no profile list.");
+    }
+
+    public static async Task<int?> GetLinkedProfileCountAsync()
+    {
+        string value = await RunAsync("linked-status");
+        return int.TryParse(value, out int count) ? count : null;
     }
 
     public static async Task<bool> IsAppEnabledAsync()
