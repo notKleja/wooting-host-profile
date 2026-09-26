@@ -42,6 +42,7 @@ rm -rf "$app_dir"
 mkdir -p "$macos_dir" "$resources_dir" "$target_dir/swift-module-cache" "$target_dir/clang-module-cache"
 cp "$binary" "$resources_dir/wooting-host-profile-agent"
 chmod 755 "$resources_dir/wooting-host-profile-agent"
+xattr -c "$resources_dir/wooting-host-profile-agent"
 cp "$project_dir/macos/AppIcon.icns" "$resources_dir/AppIcon.icns"
 
 CLANG_MODULE_CACHE_PATH="$target_dir/clang-module-cache" \

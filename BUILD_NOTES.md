@@ -97,6 +97,8 @@ The macOS app was built and verified on Apple silicon with macOS 27 and Xcode
   binaries.
 - The app bundle was ad-hoc signed, passed strict deep signature verification,
   and retained both executables after ZIP extraction.
+- The unsigned installer PKG expanded successfully and retained both app
+  executables in its `/Applications` payload.
 - The bundle and embedded agent reported version 0.5.0 from `Cargo.toml`.
 - The generated SHA-256 checksum matched the portable ZIP.
 - Thirteen Rust unit tests passed.

@@ -49,16 +49,17 @@ tools and Rust, then build, install, and open it with:
 ./scripts/install-macos.sh
 ```
 
-The app is installed under `~/Applications`. To produce the same ad-hoc-signed
-app bundle as a portable ZIP instead, run:
+The app is installed under `~/Applications`. To produce release artifacts, run:
 
 ```sh
 ./scripts/package-macos.sh
 ```
 
-The ZIP and its SHA-256 checksum are written to `dist/macos`. A Developer ID
-signature and Apple notarization are not included, so builds shared with other
-Macs may require Gatekeeper approval. See the
+The command writes a portable ZIP, an installer PKG targeting `/Applications`,
+and their SHA-256 checksums to `dist/macos`. The app is ad-hoc signed, while the
+PKG is unsigned; a Developer ID signature and Apple notarization are not
+included. Builds shared with other Macs may therefore require Gatekeeper
+approval. See the
 [macOS installation guide](https://github.com/notKleja/wooting-host-profile/wiki/macOS-Installation)
 for more detail.
 

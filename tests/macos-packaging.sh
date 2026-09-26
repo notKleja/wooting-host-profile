@@ -16,6 +16,7 @@ version=$(sed -n '/^version = "/ { s/^version = "//; s/"$//; p; q; }' "$project_
 architecture=$(uname -m)
 app="$output_dir/Wooting Switch.app"
 archive="$output_dir/Wooting-Switch-macOS-$architecture.zip"
+installer="$output_dir/Wooting-Switch-Setup-macOS-$architecture.pkg"
 checksum_file="$output_dir/SHA256SUMS-macOS.txt"
 
 test -x "$app/Contents/MacOS/WootingHostProfile"
@@ -26,6 +27,7 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.
 test "$("$app/Contents/Resources/wooting-host-profile-agent" --version)" = "wooting-host-profile $version"
 codesign --verify --deep --strict "$app"
 test -s "$archive"
+test -s "$installer"
 test -s "$checksum_file"
 
 extracted="$test_root/extracted"
@@ -34,9 +36,24 @@ ditto -x -k "$archive" "$extracted"
 test -x "$extracted/Wooting Switch.app/Contents/MacOS/WootingHostProfile"
 test -x "$extracted/Wooting Switch.app/Contents/Resources/wooting-host-profile-agent"
 
+package_contents="$test_root/package-contents"
+pkgutil --expand-full "$installer" "$package_contents"
+test -x "$package_contents/Payload/Wooting Switch.app/Contents/MacOS/WootingHostProfile"
+test -x "$package_contents/Payload/Wooting Switch.app/Contents/Resources/wooting-host-profile-agent"
+pkgutil --check-signature "$installer" | grep -F "Status: no signature" >/dev/null
+if pkgutil --payload-files "$installer" | grep -E '(^|/)\._' >/dev/null; then
+    echo "installer contains AppleDouble metadata files" >&2
+    exit 1
+fi
+
 expected=$(awk -v name="$(basename "$archive")" '$2 == name { print $1 }' "$checksum_file")
 actual=$(shasum -a 256 "$archive" | awk '{ print $1 }')
 test -n "$expected"
 test "$actual" = "$expected"
 
-printf 'macOS package smoke test passed for %s\n' "$archive"
+expected=$(awk -v name="$(basename "$installer")" '$2 == name { print $1 }' "$checksum_file")
+actual=$(shasum -a 256 "$installer" | awk '{ print $1 }')
+test -n "$expected"
+test "$actual" = "$expected"
+
+printf 'macOS package smoke test passed for %s and %s\n' "$archive" "$installer"
