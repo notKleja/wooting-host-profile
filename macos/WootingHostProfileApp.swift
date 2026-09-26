@@ -253,7 +253,8 @@ final class ProfileModel: ObservableObject {
     }
 
     private func applyStatusIconVisibility() {
-        StatusItemController.shared.setVisible(!hideStatusIcon)
+        StatusItemController.shared.setVisible(true)
+        NSApp.setActivationPolicy(hideStatusIcon ? .accessory : .regular)
     }
 }
 
@@ -309,8 +310,7 @@ private final class StatusItemController: NSObject {
         }
     }
 
-    @objc private func showWindow() {
-        NSApp.setActivationPolicy(.regular)
+    @objc func showWindow() {
         NSApp.windows.first?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -590,7 +590,7 @@ struct ContentView: View {
                             enabled: !model.busy
                         )
                         WootingCheckbox(
-                            title: "Hide tray icon",
+                            title: "Hide Dock icon",
                             checked: hideStatusIcon,
                             enabled: !model.busy
                         )
@@ -668,14 +668,83 @@ struct ContentView: View {
     }
 }
 
+@MainActor
+private final class SingleInstanceController: NSObject {
+    static let shared = SingleInstanceController()
+    private let showNotification = Notification.Name("io.local.wooting-host-profile.show-window")
+    private var lockDescriptor: Int32 = -1
+
+    func claimOrSignalExisting() -> Bool {
+        let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("WootingHostProfile", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: cacheDirectory,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return fallbackClaim()
+        }
+
+        let path = cacheDirectory.appendingPathComponent("app.lock").path
+        let descriptor = Darwin.open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { return fallbackClaim() }
+
+        if Darwin.lockf(descriptor, F_TLOCK, 0) == 0 {
+            lockDescriptor = descriptor
+            DistributedNotificationCenter.default().addObserver(
+                self,
+                selector: #selector(showExistingWindow),
+                name: showNotification,
+                object: nil
+            )
+            return true
+        }
+
+        Darwin.close(descriptor)
+        signalExisting()
+        return false
+    }
+
+    private func fallbackClaim() -> Bool {
+        let currentProcess = ProcessInfo.processInfo.processIdentifier
+        if NSRunningApplication.runningApplications(withBundleIdentifier: "io.local.wooting-host-profile")
+            .contains(where: { $0.processIdentifier != currentProcess }) {
+            signalExisting()
+            return false
+        }
+        return true
+    }
+
+    private func signalExisting() {
+        let currentProcess = ProcessInfo.processInfo.processIdentifier
+        DistributedNotificationCenter.default().postNotificationName(
+            showNotification,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        NSRunningApplication.runningApplications(withBundleIdentifier: "io.local.wooting-host-profile")
+            .first(where: { $0.processIdentifier != currentProcess })?
+            .activate(options: [.activateAllWindows])
+    }
+
+    @objc private func showExistingWindow() {
+        StatusItemController.shared.showWindow()
+    }
+
+    deinit {
+        if lockDescriptor >= 0 {
+            Darwin.lockf(lockDescriptor, F_ULOCK, 0)
+            Darwin.close(lockDescriptor)
+        }
+    }
+}
+
 @main
 struct WootingSwitchApp: App {
     init() {
-        let bundleIdentifier = "io.local.wooting-host-profile"
-        let currentProcess = ProcessInfo.processInfo.processIdentifier
-        if let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
-            .first(where: { $0.processIdentifier != currentProcess }) {
-            existing.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        if !SingleInstanceController.shared.claimOrSignalExisting() {
             exit(0)
         }
     }

@@ -102,6 +102,10 @@ The macOS app was built and verified on Apple silicon with macOS 27 and Xcode
 - The macOS content area mirrors the Windows/Wootility palette, 460-point
   geometry, profile states, custom dropdown, action button, checkbox card, and
   status treatment while retaining standard macOS window controls.
+- `Hide Dock icon` switches the app to accessory activation policy while
+  retaining the menu-bar control used to reopen it.
+- A non-blocking per-user process lock rejects concurrent launches; a
+  distributed notification raises the existing window instead.
 - The bundle and embedded agent reported version 0.5.0 from `Cargo.toml`.
 - The generated SHA-256 checksum matched the portable ZIP.
 - Thirteen Rust unit tests passed.
