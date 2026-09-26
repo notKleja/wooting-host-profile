@@ -10,10 +10,9 @@ on the keyboard and are still created and edited in Wootility.
 ## Download for Windows
 
 1. Open the [latest release](https://github.com/notKleja/wooting-host-profile/releases/latest).
-2. Download `Wooting-Switch-Windows-x64.zip`.
-3. Extract the ZIP.
-4. Double-click `Install-Wooting-Switch.cmd`.
-5. Open **Wooting Switch**, choose a profile, and select **Remember & activate**.
+2. Download `Wooting-Switch-Setup-Windows-x64.exe`.
+3. Run the installer.
+4. Open **Wooting Switch**, choose a profile, and select **Remember & activate**.
 
 The Windows build is currently unsigned, so Windows may show an Unknown
 Publisher warning. The complete source code is available in this repository.
