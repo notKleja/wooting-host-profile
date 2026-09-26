@@ -88,5 +88,21 @@ those names locally for future offline fallback.
 The upstream `wooting-rgb-sys` static library emits Microsoft linker LNK4217
 warnings. They do not prevent compilation or the tested USB/profile operations.
 
-The SwiftUI macOS front end and macOS HID behavior must be compiled and tested
-on the target Mac; they cannot be validated from this Windows host.
+## macOS build and hardware verification
+
+The macOS app was built and verified on Apple silicon with macOS 27 and Xcode
+27 on 2026-09-26.
+
+- The Rust agent and SwiftUI front end compiled as deployment-target macOS 13
+  binaries.
+- The app bundle was ad-hoc signed, passed strict deep signature verification,
+  and retained both executables after ZIP extraction.
+- The bundle and embedded agent reported version 0.5.0 from `Cargo.toml`.
+- The generated SHA-256 checksum matched the portable ZIP.
+- Thirteen Rust unit tests passed.
+- A connected Wooting 60HE+ exposed `Typing Profile` and `mac profile` through
+  the current macOS HID backend.
+- The live heartbeat read reported P2 (`mac profile`) as active.
+- The macOS transport uses current `hidapi` directly because the HID backend
+  vendored by `wooting-rgb-sys` did not receive command responses on this Mac.
+  Windows and other platforms retain the existing Wooting SDK binding.

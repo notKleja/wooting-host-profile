@@ -42,10 +42,25 @@ selects profiles that already exist on the keyboard.
 
 ## macOS
 
-The SwiftUI app is included in the source but is not yet distributed as a
-prebuilt, signed download. See the
+The native SwiftUI app supports macOS 13 or newer. Install Xcode command-line
+tools and Rust, then build, install, and open it with:
+
+```sh
+./scripts/install-macos.sh
+```
+
+The app is installed under `~/Applications`. To produce the same ad-hoc-signed
+app bundle as a portable ZIP instead, run:
+
+```sh
+./scripts/package-macos.sh
+```
+
+The ZIP and its SHA-256 checksum are written to `dist/macos`. A Developer ID
+signature and Apple notarization are not included, so builds shared with other
+Macs may require Gatekeeper approval. See the
 [macOS installation guide](https://github.com/notKleja/wooting-host-profile/wiki/macOS-Installation)
-to build it locally with Xcode and Rust.
+for more detail.
 
 ## Help and documentation
 

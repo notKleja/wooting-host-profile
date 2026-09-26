@@ -21,9 +21,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use encoding_rs::{UTF_16LE, WINDOWS_1252};
 use fs2::FileExt;
+#[cfg(target_os = "macos")]
+use hidapi::{HidApi, HidDevice};
 use rusty_leveldb::{CompressorId, DB, LdbIterator, Options, compressor::SnappyCompressor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(not(target_os = "macos"))]
 use wooting_rgb_sys as rgb;
 
 const GET_CURRENT_KEYBOARD_PROFILE_INDEX: u8 = 11;
@@ -46,6 +49,35 @@ const MIN_ENFORCE_INTERVAL_MS: u64 = 1_000;
 const MAX_ENFORCE_INTERVAL_MS: u64 = 3_600_000;
 const MAX_LOG_BYTES: u64 = 1_048_576;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+const WOOTING_VENDOR_IDS: [u16; 2] = [0x03EB, 0x31E3];
+const WOOTING_CONFIG_USAGE_PAGE: u16 = 0x1337;
+const WOOTING_V3_CONFIG_USAGE_PAGE: u16 = 0xFF55;
+const MAX_HID_RESPONSE_SIZE: usize = 2_047;
+
+fn validated_response_length(response: i32, buffer_size: usize) -> Result<usize> {
+    let length = usize::try_from(response).context("keyboard response read failed")?;
+    if length == 0 {
+        bail!("keyboard response timed out")
+    }
+    if length > buffer_size {
+        bail!("keyboard response exceeded its allocated buffer")
+    }
+    Ok(length)
+}
+
+fn command_report(multi_report: bool, command: u8, profile: u8) -> [u8; 8] {
+    [
+        u8::from(multi_report),
+        if multi_report { 0xD1 } else { 0xD0 },
+        0xDA,
+        command,
+        profile,
+        0,
+        0,
+        0,
+    ]
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
@@ -674,12 +706,36 @@ fn should_enforce(state: KeyboardState, enabled: bool, enforce: bool) -> bool {
     state.wootdev == WootDevOwnership::Inactive && enabled && enforce
 }
 
+fn read_current_state_with<F, G>(
+    supports_heartbeat: bool,
+    heartbeat: F,
+    legacy: G,
+) -> Result<KeyboardState>
+where
+    F: FnOnce() -> Result<KeyboardState>,
+    G: FnOnce() -> Result<KeyboardState>,
+{
+    if supports_heartbeat {
+        heartbeat().or_else(|heartbeat_error| {
+            legacy().with_context(|| format!("heartbeat state failed: {heartbeat_error:#}"))
+        })
+    } else {
+        legacy()
+    }
+}
+
 struct Keyboard {
     _device_lock: fs::File,
+    #[cfg(target_os = "macos")]
+    device: HidDevice,
+    #[cfg(target_os = "macos")]
+    multi_report: bool,
+    #[cfg(target_os = "macos")]
+    v2_interface: bool,
 }
 
 impl Keyboard {
-    fn connect_first() -> Option<Self> {
+    fn lock_device() -> Option<fs::File> {
         let lock_directory = dirs::cache_dir()?.join("WootingHostProfile");
         fs::create_dir_all(&lock_directory).ok()?;
         let device_lock = OpenOptions::new()
@@ -690,6 +746,36 @@ impl Keyboard {
             .open(lock_directory.join("device.lock"))
             .ok()?;
         FileExt::try_lock_exclusive(&device_lock).ok()?;
+        Some(device_lock)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn connect_first() -> Option<Self> {
+        let device_lock = Self::lock_device()?;
+        let api = HidApi::new().ok()?;
+        let info = api.device_list().find(|device| {
+            WOOTING_VENDOR_IDS.contains(&device.vendor_id())
+                && matches!(
+                    device.usage_page(),
+                    WOOTING_CONFIG_USAGE_PAGE | WOOTING_V3_CONFIG_USAGE_PAGE
+                )
+        })?;
+        let multi_report = info.usage_page() == WOOTING_V3_CONFIG_USAGE_PAGE;
+        let v2_interface = !matches!(info.product_id(), 0xFF01 | 0xFF02);
+        let device = info.open_device(&api).ok()?;
+        let keyboard = Self {
+            _device_lock: device_lock,
+            device,
+            multi_report,
+            v2_interface,
+        };
+        let _ = keyboard.send_feature(WOOT_DEV_RESET_ALL, 0, "RGB ownership reset");
+        Some(keyboard)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn connect_first() -> Option<Self> {
+        let device_lock = Self::lock_device()?;
         unsafe {
             rgb::wooting_usb_disconnect(false);
             if !rgb::wooting_usb_find_keyboard() {
@@ -709,6 +795,23 @@ impl Keyboard {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    fn command_response(&self, command: u8, profile: u8) -> Result<Vec<u8>> {
+        let report = command_report(self.multi_report, command, profile);
+        self.device
+            .send_feature_report(&report)
+            .with_context(|| format!("keyboard rejected command {command}"))?;
+        let mut buffer = vec![0_u8; MAX_HID_RESPONSE_SIZE];
+        let response = self
+            .device
+            .read_timeout(&mut buffer, 1_000)
+            .with_context(|| format!("keyboard could not read command {command} response"))?;
+        let response_length = validated_response_length(i32::try_from(response)?, buffer.len())?;
+        buffer.truncate(response_length);
+        Ok(buffer)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[allow(clippy::unused_self)]
     fn command_response(&self, command: u8, profile: u8) -> Result<Vec<u8>> {
         unsafe {
@@ -733,90 +836,108 @@ impl Keyboard {
         }
     }
 
+    fn uses_multi_report(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.multi_report
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            rgb::wooting_usb_use_multi_report()
+        }
+    }
+
+    fn uses_v2_interface(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.v2_interface
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            rgb::wooting_usb_use_v2_interface()
+        }
+    }
+
     fn legacy_state(&self) -> Result<KeyboardState> {
         let buffer = self.command_response(GET_CURRENT_KEYBOARD_PROFILE_INDEX, 0)?;
-        unsafe {
-            let uses_multi_report = rgb::wooting_usb_use_multi_report();
-            validate_response_command(
-                &buffer,
-                GET_CURRENT_KEYBOARD_PROFILE_INDEX,
-                uses_multi_report,
-            )?;
-            let report_offset = usize::from(uses_multi_report);
-            let extra_data_offset = usize::from(uses_multi_report);
-            let is_v2 = rgb::wooting_usb_use_v2_interface();
-            let data_offset = report_offset + if is_v2 { 5 } else { 4 } + extra_data_offset;
-            let profile = parse_legacy_profile(&buffer, data_offset)?;
-            Ok(KeyboardState {
-                profile,
-                wootdev: WootDevOwnership::Unknown,
-            })
-        }
+        let uses_multi_report = self.uses_multi_report();
+        validate_response_command(
+            &buffer,
+            GET_CURRENT_KEYBOARD_PROFILE_INDEX,
+            uses_multi_report,
+        )?;
+        let report_offset = usize::from(uses_multi_report);
+        let extra_data_offset = usize::from(uses_multi_report);
+        let data_offset =
+            report_offset + if self.uses_v2_interface() { 5 } else { 4 } + extra_data_offset;
+        let profile = parse_legacy_profile(&buffer, data_offset)?;
+        Ok(KeyboardState {
+            profile,
+            wootdev: WootDevOwnership::Unknown,
+        })
     }
 
     fn heartbeat_state(&self) -> Result<KeyboardState> {
         let buffer = self.command_response(HEARTBEAT, 0)?;
-        unsafe {
-            let multi_report = rgb::wooting_usb_use_multi_report();
-            validate_response_command(&buffer, HEARTBEAT, multi_report)?;
-            let command_offset = 2 + usize::from(multi_report);
-            let mut cursor = command_offset + 2;
-            let mut profile = None;
-            let mut wootdev = None;
-            while let Some(&tag) = buffer.get(cursor) {
-                if tag == 0 {
+        let multi_report = self.uses_multi_report();
+        validate_response_command(&buffer, HEARTBEAT, multi_report)?;
+        let command_offset = 2 + usize::from(multi_report);
+        let mut cursor = command_offset + 2;
+        let mut profile = None;
+        let mut wootdev = None;
+        while let Some(&tag) = buffer.get(cursor) {
+            if tag == 0 {
+                break;
+            }
+            cursor += 1;
+            if tag & 0x07 != 0 {
+                bail!("heartbeat contained an unsupported protobuf field")
+            }
+            let mut value = 0_u64;
+            let mut shift = 0_u32;
+            loop {
+                let byte = *buffer
+                    .get(cursor)
+                    .context("heartbeat protobuf was truncated")?;
+                cursor += 1;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
                     break;
                 }
-                cursor += 1;
-                if tag & 0x07 != 0 {
-                    bail!("heartbeat contained an unsupported protobuf field")
-                }
-                let mut value = 0_u64;
-                let mut shift = 0_u32;
-                loop {
-                    let byte = *buffer
-                        .get(cursor)
-                        .context("heartbeat protobuf was truncated")?;
-                    cursor += 1;
-                    value |= u64::from(byte & 0x7f) << shift;
-                    if byte & 0x80 == 0 {
-                        break;
-                    }
-                    shift += 7;
-                    if shift >= 64 {
-                        bail!("heartbeat protobuf varint was invalid")
-                    }
-                }
-                match tag >> 3 {
-                    1 => profile = Some(u8::try_from(value)?),
-                    2 => {
-                        wootdev = Some(if value != 0 {
-                            WootDevOwnership::Active
-                        } else {
-                            WootDevOwnership::Inactive
-                        });
-                    }
-                    _ => {}
+                shift += 7;
+                if shift >= 64 {
+                    bail!("heartbeat protobuf varint was invalid")
                 }
             }
-            let profile = profile.context("heartbeat omitted the active profile")?;
-            if profile >= PROFILE_COUNT {
-                bail!("heartbeat returned unsupported onboard profile index {profile}")
+            match tag >> 3 {
+                1 => profile = Some(u8::try_from(value)?),
+                2 => {
+                    wootdev = Some(if value != 0 {
+                        WootDevOwnership::Active
+                    } else {
+                        WootDevOwnership::Inactive
+                    });
+                }
+                _ => {}
             }
-            Ok(KeyboardState {
-                profile,
-                wootdev: wootdev.unwrap_or(WootDevOwnership::Unknown),
-            })
         }
+        let profile = profile.context("heartbeat omitted the active profile")?;
+        if profile >= PROFILE_COUNT {
+            bail!("heartbeat returned unsupported onboard profile index {profile}")
+        }
+        Ok(KeyboardState {
+            profile,
+            wootdev: wootdev.unwrap_or(WootDevOwnership::Unknown),
+        })
     }
 
     fn current_state(&self) -> Result<KeyboardState> {
-        let supports_heartbeat = unsafe { rgb::wooting_usb_use_multi_report() };
-        if supports_heartbeat {
-            self.heartbeat_state()
-        } else {
-            self.legacy_state()
-        }
+        let supports_heartbeat = self.uses_multi_report();
+        read_current_state_with(
+            supports_heartbeat,
+            || self.heartbeat_state(),
+            || self.legacy_state(),
+        )
     }
 
     fn current_profile(&self) -> Result<u8> {
@@ -825,56 +946,36 @@ impl Keyboard {
 
     #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
     fn profile_name(&self, profile: u8) -> Result<Option<String>> {
-        unsafe {
-            let response_size = rgb::wooting_usb_get_response_size() as usize;
-            if response_size == 0 {
-                bail!("keyboard reported a zero-length response buffer")
-            }
+        let buffer = self.command_response(GET_PROFILE_METADATA, profile)?;
+        let uses_multi_report = self.uses_multi_report();
+        let report_offset = usize::from(uses_multi_report);
+        let extra_data_offset = usize::from(uses_multi_report);
+        validate_response_command(&buffer, GET_PROFILE_METADATA, uses_multi_report)?;
 
-            let uses_multi_report = rgb::wooting_usb_use_multi_report();
-            let report_offset = usize::from(uses_multi_report);
-            let extra_data_offset = usize::from(uses_multi_report);
-            let mut buffer = vec![0_u8; response_size];
-            let response = rgb::wooting_usb_send_feature_with_response(
-                buffer.as_mut_ptr(),
-                response_size,
-                GET_PROFILE_METADATA,
-                0,
-                0,
-                0,
-                profile,
-            );
-            let expected_response = i32::try_from(response_size)?;
-            if response != expected_response {
-                bail!("profile metadata read failed")
-            }
-            validate_response_command(&buffer, GET_PROFILE_METADATA, uses_multi_report)?;
-
-            let is_v2 = rgb::wooting_usb_use_v2_interface();
-            let data_offset = report_offset + if is_v2 { 5 } else { 4 } + extra_data_offset;
-            let data = buffer
-                .get(data_offset..)
-                .context("profile metadata response had no payload")?;
-            let payload_length = usize::from(*data.first().context("metadata length was missing")?);
-            if payload_length == 0 {
-                return Ok(None);
-            }
-            let protobuf = data
-                .get(2..2 + payload_length)
-                .context("profile metadata payload was truncated")?;
-            if protobuf.first() != Some(&0x0A) {
-                bail!("profile metadata did not contain a name")
-            }
-            let name_length = usize::from(
-                *protobuf
-                    .get(1)
-                    .context("profile metadata name length was missing")?,
-            );
-            let name = protobuf
-                .get(2..2 + name_length)
-                .context("profile metadata name was truncated")?;
-            Ok(Some(String::from_utf8(name.to_vec())?))
+        let data_offset =
+            report_offset + if self.uses_v2_interface() { 5 } else { 4 } + extra_data_offset;
+        let data = buffer
+            .get(data_offset..)
+            .context("profile metadata response had no payload")?;
+        let payload_length = usize::from(*data.first().context("metadata length was missing")?);
+        if payload_length == 0 {
+            return Ok(None);
         }
+        let protobuf = data
+            .get(2..2 + payload_length)
+            .context("profile metadata payload was truncated")?;
+        if protobuf.first() != Some(&0x0A) {
+            bail!("profile metadata did not contain a name")
+        }
+        let name_length = usize::from(
+            *protobuf
+                .get(1)
+                .context("profile metadata name length was missing")?,
+        );
+        let name = protobuf
+            .get(2..2 + name_length)
+            .context("profile metadata name was truncated")?;
+        Ok(Some(String::from_utf8(name.to_vec())?))
     }
 
     #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
@@ -889,9 +990,7 @@ impl Keyboard {
             self.send_feature(ACTIVATE_PROFILE, profile, "profile activation")?;
             thread::sleep(Duration::from_millis(100));
 
-            let modern = unsafe {
-                rgb::wooting_usb_use_v2_interface() || rgb::wooting_usb_use_multi_report()
-            };
+            let modern = self.uses_v2_interface() || self.uses_multi_report();
             let reload = if modern {
                 RELOAD_PROFILE
             } else {
@@ -923,8 +1022,7 @@ impl Keyboard {
             }
         }
 
-        let modern =
-            unsafe { rgb::wooting_usb_use_v2_interface() || rgb::wooting_usb_use_multi_report() };
+        let modern = self.uses_v2_interface() || self.uses_multi_report();
         if config.refresh_lighting && !modern {
             thread::sleep(Duration::from_millis(config.command_delay_ms));
             self.send_feature(REFRESH_RGB_COLORS, profile, "legacy RGB refresh")?;
@@ -932,6 +1030,14 @@ impl Keyboard {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    fn send_feature(&self, command: u8, profile: u8, operation: &str) -> Result<()> {
+        self.command_response(command, profile)
+            .with_context(|| format!("keyboard rejected {operation} command {command}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[allow(clippy::unused_self)] // The value is a guard for the selected global SDK device.
     fn send_feature(&self, command: u8, profile: u8, operation: &str) -> Result<()> {
         unsafe {
@@ -993,6 +1099,7 @@ impl Drop for WootDevSession<'_> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for Keyboard {
     fn drop(&mut self) {
         unsafe {
@@ -2068,6 +2175,36 @@ mod tests {
     }
 
     #[test]
+    fn accepts_nonempty_hid_reports_up_to_the_buffer_size() {
+        assert_eq!(validated_response_length(32, 2_046).unwrap(), 32);
+        assert_eq!(validated_response_length(2_046, 2_046).unwrap(), 2_046);
+        assert!(validated_response_length(0, 2_046).is_err());
+        assert!(validated_response_length(-1, 2_046).is_err());
+        assert!(validated_response_length(2_047, 2_046).is_err());
+    }
+
+    #[test]
+    fn builds_wooting_command_reports_for_each_transport() {
+        assert_eq!(
+            command_report(true, HEARTBEAT, 2),
+            [1, 0xD1, 0xDA, HEARTBEAT, 2, 0, 0, 0]
+        );
+        assert_eq!(
+            command_report(false, GET_CURRENT_KEYBOARD_PROFILE_INDEX, 1),
+            [
+                0,
+                0xD0,
+                0xDA,
+                GET_CURRENT_KEYBOARD_PROFILE_INDEX,
+                1,
+                0,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
     fn parses_only_valid_legacy_profile_indexes() {
         assert_eq!(parse_legacy_profile(&[0, 1], 1).unwrap(), 1);
         assert!(parse_legacy_profile(&[0, 8], 1).is_err());
@@ -2087,6 +2224,18 @@ mod tests {
         assert!(!should_enforce(state, true, true));
         assert!(!should_enforce(state, false, true));
         assert!(!should_enforce(state, true, false));
+    }
+
+    #[test]
+    fn falls_back_to_legacy_state_when_heartbeat_fails() {
+        let legacy = KeyboardState {
+            profile: 1,
+            wootdev: WootDevOwnership::Unknown,
+        };
+        let state = read_current_state_with(true, || bail!("heartbeat unavailable"), || Ok(legacy))
+            .unwrap();
+        assert_eq!(state.profile, 1);
+        assert_eq!(state.wootdev, WootDevOwnership::Unknown);
     }
 
     #[test]
