@@ -99,6 +99,9 @@ The macOS app was built and verified on Apple silicon with macOS 27 and Xcode
   and retained both executables after ZIP extraction.
 - The unsigned installer PKG expanded successfully and retained both app
   executables in its `/Applications` payload.
+- The macOS content area mirrors the Windows/Wootility palette, 460-point
+  geometry, profile states, custom dropdown, action button, checkbox card, and
+  status treatment while retaining standard macOS window controls.
 - The bundle and embedded agent reported version 0.5.0 from `Cargo.toml`.
 - The generated SHA-256 checksum matched the portable ZIP.
 - Thirteen Rust unit tests passed.

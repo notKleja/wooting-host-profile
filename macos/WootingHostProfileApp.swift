@@ -253,126 +253,418 @@ final class ProfileModel: ObservableObject {
     }
 
     private func applyStatusIconVisibility() {
-        NSApp.setActivationPolicy(hideStatusIcon ? .accessory : .regular)
+        StatusItemController.shared.setVisible(!hideStatusIcon)
+    }
+}
+
+private enum WootingTheme {
+    static let canvas = Color(red: 24 / 255, green: 26 / 255, blue: 27 / 255)
+    static let surface = Color(red: 32 / 255, green: 36 / 255, blue: 38 / 255)
+    static let hover = Color(red: 41 / 255, green: 46 / 255, blue: 49 / 255)
+    static let border = Color(red: 52 / 255, green: 58 / 255, blue: 61 / 255)
+    static let text = Color(red: 232 / 255, green: 235 / 255, blue: 237 / 255)
+    static let muted = Color(red: 166 / 255, green: 173 / 255, blue: 181 / 255)
+    static let accent = Color(red: 255 / 255, green: 212 / 255, blue: 92 / 255)
+    static let accentHover = Color(red: 255 / 255, green: 224 / 255, blue: 138 / 255)
+    static let accentPressed = Color(red: 232 / 255, green: 188 / 255, blue: 67 / 255)
+    static let status = Color(red: 48 / 255, green: 53 / 255, blue: 56 / 255)
+}
+
+@MainActor
+private final class StatusItemController: NSObject {
+    static let shared = StatusItemController()
+    private var item: NSStatusItem?
+
+    func setVisible(_ visible: Bool) {
+        if visible, item == nil {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            if let imageURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+               let image = NSImage(contentsOf: imageURL) {
+                image.size = NSSize(width: 18, height: 18)
+                item.button?.image = image
+            }
+            item.button?.toolTip = "Wooting Switch"
+            item.button?.target = self
+            item.button?.action = #selector(openWindow)
+            item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            self.item = item
+        } else if !visible, let item {
+            NSStatusBar.system.removeStatusItem(item)
+            self.item = nil
+        }
+    }
+
+    @objc private func openWindow() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            let menu = NSMenu()
+            menu.addItem(withTitle: "Open Wooting Switch", action: #selector(showWindow), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Exit", action: #selector(exitApp), keyEquivalent: "")
+            menu.items.forEach { $0.target = self }
+            item?.menu = menu
+            item?.button?.performClick(nil)
+            item?.menu = nil
+        } else {
+            showWindow()
+        }
+    }
+
+    @objc private func showWindow() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func exitApp() {
+        NSApp.terminate(nil)
+    }
+}
+
+private struct HoverButton<Label: View>: View {
+    let enabled: Bool
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+    @State private var hovering = false
+    @State private var pressing = false
+
+    var body: some View {
+        Button(action: action) { label() }
+            .buttonStyle(.plain)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(background)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(enabled ? WootingTheme.accent : WootingTheme.border, lineWidth: 1)
+            )
+            .opacity(enabled ? 1 : 0.48)
+            .disabled(!enabled)
+            .onHover { hovering = $0 }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in pressing = true }
+                    .onEnded { _ in pressing = false }
+            )
+    }
+
+    private var background: Color {
+        if !enabled { return WootingTheme.surface }
+        if pressing { return WootingTheme.accentPressed }
+        if hovering { return WootingTheme.accentHover }
+        return WootingTheme.accent
+    }
+}
+
+private struct WootingCheckbox: View {
+    let title: String
+    var subtitle: String?
+    @Binding var checked: Bool
+    let enabled: Bool
+    @State private var hovering = false
+
+    var body: some View {
+        Button {
+            guard enabled else { return }
+            checked.toggle()
+        } label: {
+            HStack(spacing: 9) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(checked ? WootingTheme.accent : (hovering ? WootingTheme.hover : .clear))
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(checked ? WootingTheme.accent : WootingTheme.muted.opacity(0.7), lineWidth: 1)
+                    if checked {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .black))
+                            .foregroundStyle(WootingTheme.canvas)
+                    }
+                }
+                .frame(width: 17, height: 17)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(WootingTheme.text)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.system(size: 10, weight: .regular))
+                            .foregroundStyle(WootingTheme.muted)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 1)
+            .frame(minHeight: subtitle == nil ? 29 : 38)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
+        .onHover { hovering = $0 }
+    }
+}
+
+private struct ProfileRow: View {
+    let profile: KeyboardProfile
+
+    private var state: String {
+        if profile.active && profile.assigned == true { return "ACTIVE · MAC DEFAULT" }
+        if profile.active { return "ACTIVE" }
+        if profile.assigned == true { return "MAC DEFAULT" }
+        return ""
+    }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Text("P\(profile.index)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(WootingTheme.muted)
+                .frame(width: 20, alignment: .leading)
+            Text(profile.name)
+                .font(.system(size: 13))
+                .foregroundStyle(WootingTheme.text)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            if !state.isEmpty {
+                Text(state)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(WootingTheme.accent)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProfileDropdown: View {
+    let profiles: [KeyboardProfile]
+    @Binding var selection: Int
+    let enabled: Bool
+    @State private var expanded = false
+    @State private var hovering = false
+
+    private var selected: KeyboardProfile? {
+        profiles.first(where: { $0.index == selection })
+    }
+
+    var body: some View {
+        Button {
+            if enabled { expanded.toggle() }
+        } label: {
+            HStack(spacing: 8) {
+                if let selected {
+                    ProfileRow(profile: selected)
+                } else {
+                    Text("Choose profile")
+                        .font(.system(size: 13))
+                        .foregroundStyle(WootingTheme.muted)
+                    Spacer()
+                }
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(WootingTheme.muted)
+            }
+            .padding(.horizontal, 11)
+            .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(hovering ? WootingTheme.hover : WootingTheme.surface)
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(expanded ? WootingTheme.accent.opacity(0.8) : WootingTheme.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .opacity(enabled ? 1 : 0.5)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .topLeading) {
+            if expanded {
+                VStack(spacing: 2) {
+                    ForEach(profiles) { profile in
+                        Button {
+                            selection = profile.index
+                            expanded = false
+                        } label: {
+                            ProfileRow(profile: profile)
+                                .padding(.horizontal, 10)
+                                .frame(height: 34)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(ProfileOptionButtonStyle(selected: profile.index == selection))
+                    }
+                }
+                .padding(4)
+                .background(WootingTheme.surface)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(WootingTheme.border, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .shadow(color: .black.opacity(0.45), radius: 16, y: 8)
+                .offset(y: 40)
+                .zIndex(100)
+            }
+        }
+        .zIndex(expanded ? 100 : 1)
+    }
+}
+
+private struct ProfileOptionButtonStyle: ButtonStyle {
+    let selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                selected
+                    ? WootingTheme.hover
+                    : configuration.isPressed ? WootingTheme.hover.opacity(0.8) : Color.clear
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+    }
+}
+
+private struct BusyRing: View {
+    @State private var spinning = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0.12, to: 0.82)
+            .stroke(WootingTheme.accent, style: StrokeStyle(lineWidth: 2.2, lineCap: .round))
+            .frame(width: 18, height: 18)
+            .rotationEffect(.degrees(spinning ? 360 : 0))
+            .animation(.linear(duration: 0.8).repeatForever(autoreverses: false), value: spinning)
+            .onAppear { spinning = true }
     }
 }
 
 struct ContentView: View {
     @StateObject private var model = ProfileModel()
 
-    private let canvas = Color(red: 24 / 255, green: 26 / 255, blue: 27 / 255)
-    private let surface = Color(red: 32 / 255, green: 36 / 255, blue: 38 / 255)
-    private let border = Color(red: 52 / 255, green: 58 / 255, blue: 61 / 255)
-    private let text = Color(red: 232 / 255, green: 235 / 255, blue: 237 / 255)
-    private let muted = Color(red: 166 / 255, green: 173 / 255, blue: 181 / 255)
-    private let accent = Color(red: 255 / 255, green: 212 / 255, blue: 92 / 255)
-
     var body: some View {
         ZStack(alignment: .bottom) {
-            canvas.ignoresSafeArea()
+            WootingTheme.canvas
 
-            VStack(alignment: .leading, spacing: 11) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("macOS profile")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(text)
-                        Text("\(model.profiles.count) / 4 onboard profiles")
-                            .font(.system(size: 11))
-                            .foregroundStyle(muted)
+                VStack(alignment: .leading, spacing: 11) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("macOS profile")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(WootingTheme.text)
+                            Text("\(model.profiles.count) / 4 onboard profiles")
+                                .font(.system(size: 11))
+                                .foregroundStyle(WootingTheme.muted)
+                        }
+                        Spacer()
+                        if model.busy { BusyRing() }
                     }
-                    Spacer()
-                    if model.busy {
-                        ProgressView().controlSize(.small).tint(accent)
-                    }
-                }
 
-                HStack(spacing: 8) {
-                    Picker("", selection: $model.selectedProfile) {
-                        ForEach(model.profiles) { profile in
-                            HStack {
-                                Text("P\(profile.index)")
-                                Text(profile.name)
-                                if profile.active && profile.assigned == true {
-                                    Text("ACTIVE · MAC DEFAULT")
-                                } else if profile.active {
-                                    Text("ACTIVE")
-                                } else if profile.assigned == true {
-                                    Text("MAC DEFAULT")
-                                }
-                            }
-                            .tag(profile.index)
+                    HStack(spacing: 8) {
+                        ProfileDropdown(
+                            profiles: model.profiles,
+                            selection: $model.selectedProfile,
+                            enabled: !model.busy
+                        )
+
+                        HoverButton(enabled: model.canRemember, action: model.remember) {
+                            Text(model.rememberTitle)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(model.canRemember ? WootingTheme.canvas : WootingTheme.muted)
+                                .padding(.horizontal, 14)
+                                .frame(height: 36)
                         }
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
+                    .zIndex(100)
 
-                    Button(model.rememberTitle) { model.remember() }
-                        .buttonStyle(.borderedProminent)
-                        .tint(accent)
-                        .foregroundStyle(Color.black)
-                        .frame(height: 36)
-                        .disabled(!model.canRemember)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Switch profiles automatically", isOn: $model.automaticSwitching)
-                        .onChange(of: model.automaticSwitching) { model.setAutomaticSwitching($0) }
-
-                    Toggle(isOn: $model.keepProfileActive) {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text("Keep this profile active")
-                            Text("Checks every 5 seconds")
-                                .font(.system(size: 10))
-                                .foregroundStyle(muted)
-                        }
+                    VStack(spacing: 0) {
+                        WootingCheckbox(
+                            title: "Switch profiles automatically",
+                            checked: automaticSwitching,
+                            enabled: !model.busy
+                        )
+                        WootingCheckbox(
+                            title: "Keep this profile active",
+                            subtitle: "Checks every 5 seconds",
+                            checked: keepProfileActive,
+                            enabled: !model.busy
+                        )
+                        WootingCheckbox(
+                            title: "Open at sign-in",
+                            checked: startAtLogin,
+                            enabled: !model.busy
+                        )
+                        WootingCheckbox(
+                            title: "Hide tray icon",
+                            checked: hideStatusIcon,
+                            enabled: !model.busy
+                        )
                     }
-                    .onChange(of: model.keepProfileActive) { model.setEnforcement($0) }
-
-                    Toggle("Open at sign-in", isOn: $model.startAtLogin)
-                        .onChange(of: model.startAtLogin) { model.setStartup($0) }
-
-                    Toggle("Hide Dock/menu icon", isOn: $model.hideStatusIcon)
-                        .onChange(of: model.hideStatusIcon) { model.setStatusIconHidden($0) }
-                }
-                .toggleStyle(.checkbox)
-                .foregroundStyle(text)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(surface, in: RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(border, lineWidth: 1))
-
-                HStack(alignment: .top, spacing: 7) {
-                    Image(systemName: model.appLinkingStatusIcon)
-                        .font(.system(size: 11))
-                        .foregroundStyle(model.appLinkingHasConflict ? accent : muted)
-                    Text(model.appLinkingStatus)
-                        .font(.system(size: 10))
-                        .foregroundStyle(muted)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
-            .padding(.bottom, 12)
-
-            if !model.status.isEmpty {
-                Text(model.status)
-                    .font(.system(size: 11))
-                    .foregroundStyle(text)
-                    .lineLimit(2)
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(red: 48 / 255, green: 53 / 255, blue: 56 / 255))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent, lineWidth: 1))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .padding(16)
-            }
+                    .padding(.vertical, 7)
+                    .background(WootingTheme.surface)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(WootingTheme.border, lineWidth: 1))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    HStack(alignment: .top, spacing: 7) {
+                        Image(systemName: model.appLinkingStatusIcon)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(model.appLinkingHasConflict ? WootingTheme.accent : WootingTheme.muted)
+                            .padding(.top, 1)
+                        Text(model.appLinkingStatus)
+                            .font(.system(size: 10))
+                            .foregroundStyle(WootingTheme.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 14)
+
+                if !model.status.isEmpty {
+                    Text(model.status)
+                        .font(.system(size: 11))
+                        .foregroundStyle(WootingTheme.text)
+                        .lineLimit(2)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(WootingTheme.status)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(WootingTheme.accent, lineWidth: 1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(16)
+                }
         }
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear { model.refresh() }
+        .background(WootingTheme.canvas)
+        .onAppear {
+            StatusItemController.shared.setVisible(true)
+            model.refresh()
+        }
+    }
+
+    private var automaticSwitching: Binding<Bool> {
+        Binding(
+            get: { model.automaticSwitching },
+            set: { model.automaticSwitching = $0; model.setAutomaticSwitching($0) }
+        )
+    }
+
+    private var keepProfileActive: Binding<Bool> {
+        Binding(
+            get: { model.keepProfileActive },
+            set: { model.keepProfileActive = $0; model.setEnforcement($0) }
+        )
+    }
+
+    private var startAtLogin: Binding<Bool> {
+        Binding(
+            get: { model.startAtLogin },
+            set: { model.startAtLogin = $0; model.setStartup($0) }
+        )
+    }
+
+    private var hideStatusIcon: Binding<Bool> {
+        Binding(
+            get: { model.hideStatusIcon },
+            set: { model.hideStatusIcon = $0; model.setStatusIconHidden($0) }
+        )
     }
 }
 
